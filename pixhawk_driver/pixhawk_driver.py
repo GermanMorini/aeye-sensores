@@ -18,7 +18,7 @@ from pymavlink import mavutil
 
 class PixhawkReader(Node):
     def __init__(self):
-        super().__init__('pixhawk_reader')
+        super().__init__('pixhawk_driver')
 
         # Parameters
         self.declare_parameter('serial_port', '/dev/ttyACM0')

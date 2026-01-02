@@ -18,7 +18,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'pixhawk_reader = pixhawk_driver.pixhawk_reader:main',
+            'pixhawk_driver = pixhawk_driver.pixhawk_driver:main',
         ],
     },
 )
