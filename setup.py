@@ -13,7 +13,7 @@ setup(
         ('share/' + package_name, ['pixhawk_dashboard.html']),
         ('share/' + package_name + '/launch', ['launch/sensores.launch.py']),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'websockets'],
     zip_safe=True,
     description='Pixhawk reader node that publishes ROS 2 topics via MAVLink',
     license='MIT',

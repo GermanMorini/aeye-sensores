@@ -1,498 +1,477 @@
 #!/usr/bin/env python3
 """
-ROS 2 node that reads Pixhawk6X data via MAVLink and publishes standard
-ROS 2 topics (sensor_msgs/Imu, sensor_msgs/NavSatFix).
+ROS 2 node: Pixhawk (ArduPilot) MAVLink -> ROS topics
+
+Publishes:
+- /imu/data        (sensor_msgs/Imu)      : accel+gyro from SCALED_IMU2 (or SCALED_IMU), orientation from ATTITUDE_QUATERNION
+- /gps/fix         (sensor_msgs/NavSatFix): raw GNSS from GPS_RAW_INT
+- /odom            (nav_msgs/Odometry)    : pose+twist from LOCAL_POSITION_NED + attitude (EKF)
+- /velocity        (geometry_msgs/TwistStamped): linear+angular velocity (in base_link)
+
+Frames (ROS standard):
+- odom_frame:      ENU world frame (x=E, y=N, z=Up)
+- base_link_frame: FLU body frame (x=Forward, y=Left, z=Up)
+
+This assumes ArduPilot world is NED and body is FRD.
 """
+
+from __future__ import annotations
 
 import math
 import time
+from typing import Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
+
 from sensor_msgs.msg import Imu, NavSatFix, NavSatStatus
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import TwistStamped, Quaternion, Vector3
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
+
 from pymavlink import mavutil
 
 
-class PixhawkReader(Node):
+# ----------------------------
+# Math helpers (no numpy needed)
+# ----------------------------
+
+def quat_norm(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    w, x, y, z = q
+    n = math.sqrt(w*w + x*x + y*y + z*z)
+    if n == 0.0:
+        return (1.0, 0.0, 0.0, 0.0)
+    return (w/n, x/n, y/n, z/n)
+
+def quat_mul(q1, q2):
+    """Hamilton product. Quaternions are (w,x,y,z)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return (
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    )
+
+def quat_conj(q):
+    w, x, y, z = q
+    return (w, -x, -y, -z)
+
+def rotvec_by_quat(v: Tuple[float, float, float], q: Tuple[float, float, float, float]) -> Tuple[float, float, float]:
+    """Rotate vector v by quaternion q (active rotation)."""
+    q = quat_norm(q)
+    vx, vy, vz = v
+    vq = (0.0, vx, vy, vz)
+    rq = quat_mul(quat_mul(q, vq), quat_conj(q))
+    return (rq[1], rq[2], rq[3])
+
+def ros_quat_from_tuple(q) -> Quaternion:
+    w, x, y, z = q
+    out = Quaternion()
+    out.w, out.x, out.y, out.z = w, x, y, z
+    return out
+
+# Frame transforms:
+# NED -> ENU for vectors: [xE, yN, zU] = [y, x, -z]
+def vec_ned_to_enu(v_ned: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    xN, yE, zD = v_ned
+    return (yE, xN, -zD)
+
+# FRD -> FLU for body vectors: [xF, yL, zU] = [x, -y, -z]
+def vec_frd_to_flu(v_frd: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    xF, yR, zD = v_frd
+    return (xF, -yR, -zD)
+
+# Quaternion conversions:
+# We want q_enu_flu: rotation from base_link (FLU) to world (ENU).
+#
+# ArduPilot attitude quaternion in ATTITUDE_QUATERNION is the vehicle attitude in NED with body FRD.
+# Interpreting as q_ned_frd: rotation from body(FRD) to world(NED).
+#
+# Convert frames using fixed 90deg/axis swaps:
+# world: NED -> ENU is a basis change with matrix:
+#   ENU = [ 0 1 0;
+#           1 0 0;
+#           0 0 -1 ] * NED
+# body:  FRD -> FLU:
+#   FLU = [ 1 0 0;
+#           0 -1 0;
+#           0 0 -1 ] * FRD
+#
+# The corresponding quaternions for these basis changes:
+# - q_enu_ned : rotate NED axes into ENU axes (passive basis change)
+# - q_flu_frd : rotate FRD axes into FLU axes
+#
+# Easiest robust approach without matrix libs:
+# Convert by sandwiching: q_enu_flu = q_enu_ned * q_ned_frd * q_frd_flu
+# where q_frd_flu is inverse of q_flu_frd.
+#
+# For these specific axis flips/swaps, the quaternions are:
+# q_flu_frd = (0, 1, 0, 0)?? No—axis flips aren't a pure rotation if you treat it as a handedness change,
+# but here both frames remain right-handed (FRD and FLU are both right-handed, NED and ENU are right-handed).
+# They are related by 180° about X for FRD->FLU, and 180° about (1,1,0)/sqrt(2) then something for NED->ENU.
+#
+# To avoid subtle mistakes, we compute q_enu_flu by transforming basis vectors explicitly.
+
+def quat_from_rotation_matrix(R) -> Tuple[float,float,float,float]:
+    """Convert 3x3 rotation matrix to quaternion (w,x,y,z)."""
+    # R is list of lists [[r00,r01,r02],...]
+    r00,r01,r02 = R[0]
+    r10,r11,r12 = R[1]
+    r20,r21,r22 = R[2]
+    tr = r00 + r11 + r22
+    if tr > 0.0:
+        S = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * S
+        x = (r21 - r12) / S
+        y = (r02 - r20) / S
+        z = (r10 - r01) / S
+    elif (r00 > r11) and (r00 > r22):
+        S = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+        w = (r21 - r12) / S
+        x = 0.25 * S
+        y = (r01 + r10) / S
+        z = (r02 + r20) / S
+    elif r11 > r22:
+        S = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+        w = (r02 - r20) / S
+        x = (r01 + r10) / S
+        y = 0.25 * S
+        z = (r12 + r21) / S
+    else:
+        S = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+        w = (r10 - r01) / S
+        x = (r02 + r20) / S
+        y = (r12 + r21) / S
+        z = 0.25 * S
+    return quat_norm((w,x,y,z))
+
+def rotation_matrix_from_quat(q: Tuple[float,float,float,float]):
+    w,x,y,z = quat_norm(q)
+    return [
+        [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)],
+    ]
+
+def mat_mul(A,B):
+    out = [[0.0]*3 for _ in range(3)]
+    for i in range(3):
+        for j in range(3):
+            out[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j]
+    return out
+
+def transpose(A):
+    return [[A[j][i] for j in range(3)] for i in range(3)]
+
+def quat_ned_frd_to_enu_flu(q_ned_frd: Tuple[float,float,float,float]) -> Tuple[float,float,float,float]:
+    """
+    Convert rotation from body(FRD)->world(NED) into body(FLU)->world(ENU).
+    Using: R_enu_flu = T_world * R_ned_frd * T_body^-1
+    where:
+      T_world maps NED vectors into ENU vectors.
+      T_body maps FRD vectors into FLU vectors.
+    """
+    # T_world: ENU = T_world * NED
+    T_world = [
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0,-1.0],
+    ]
+    # T_body: FLU = T_body * FRD
+    T_body = [
+        [1.0, 0.0, 0.0],
+        [0.0,-1.0, 0.0],
+        [0.0, 0.0,-1.0],
+    ]
+
+    R_ned_frd = rotation_matrix_from_quat(q_ned_frd)
+    # R_enu_flu = T_world * R_ned_frd * (T_body^-1)
+    # T_body is orthonormal with det=+1 here, so inverse = transpose
+    R_enu_flu = mat_mul(mat_mul(T_world, R_ned_frd), transpose(T_body))
+    return quat_from_rotation_matrix(R_enu_flu)
+
+
+# ----------------------------
+# ROS node
+# ----------------------------
+
+class PixhawkMavlinkNode(Node):
     def __init__(self):
-        super().__init__('sensores')
+        super().__init__('pixhawk_driver')
 
         # Parameters
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baudrate', 921600)
-        self.declare_parameter('frame_id_imu', 'imu_link')
-        self.declare_parameter('frame_id_gps', 'gps')
-        self.declare_parameter('imu_topic', '/imu/data')
-        self.declare_parameter('gps_topic', '/gps/fix')
-        self.declare_parameter('velocity_topic', '/velocity')
-        self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_link_frame', 'base_link')
-        self.declare_parameter('use_raw_imu', False)
-        self.declare_parameter('use_mavlink_odometry', True)
+        self.declare_parameter('imu_frame', 'imu_link')
+        self.declare_parameter('gps_frame', 'gps')
+        self.declare_parameter('publish_rate_hz', 200.0)  # loop tick (not MAVLink rate)
 
-        serial_port = self.get_parameter('serial_port').value
-        baudrate = self.get_parameter('baudrate').value
-        self.frame_id_imu = self.get_parameter('frame_id_imu').value
-        self.frame_id_gps = self.get_parameter('frame_id_gps').value
+        port = self.get_parameter('serial_port').value
+        baud = int(self.get_parameter('baudrate').value)
+
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_link_frame = self.get_parameter('base_link_frame').value
-        imu_topic = self.get_parameter('imu_topic').value
-        gps_topic = self.get_parameter('gps_topic').value
-        velocity_topic = self.get_parameter('velocity_topic').value
-        odom_topic = self.get_parameter('odom_topic').value
-        self.use_raw_imu = self.get_parameter('use_raw_imu').value
-        self.use_mavlink_odometry = self.get_parameter('use_mavlink_odometry').value
+        self.imu_frame = self.get_parameter('imu_frame').value
+        self.gps_frame = self.get_parameter('gps_frame').value
 
         # Publishers
-        self.imu_pub = self.create_publisher(Imu, imu_topic, 10)
-        self.gps_pub = self.create_publisher(NavSatFix, gps_topic, 10)
-        self.velocity_pub = self.create_publisher(TwistStamped, velocity_topic, 10)
-        self.odom_pub = self.create_publisher(Odometry, odom_topic, 10)
+        self.pub_imu = self.create_publisher(Imu, '/imu/data', 20)
+        self.pub_gps = self.create_publisher(NavSatFix, '/gps/fix', 10)
+        self.pub_odom = self.create_publisher(Odometry, '/odom', 20)
+        self.pub_vel  = self.create_publisher(TwistStamped, '/velocity', 20)
 
-        # Connect to Pixhawk
-        self.get_logger().info(
-            f'Connecting to Pixhawk at {serial_port}:{baudrate}...'
+        # MAVLink connect
+        self.get_logger().info(f'Connecting MAVLink on {port} @ {baud}...')
+        self.mav = mavutil.mavlink_connection(
+            port,
+            baud=baud,
+            source_system=255,
+            source_component=0,
+            autoreconnect=True,
         )
+
+        self.get_logger().info('Waiting for heartbeat...')
+        hb = self.mav.wait_heartbeat(timeout=10)
+        if hb is None:
+            raise RuntimeError('No heartbeat from Pixhawk (timeout). Check port/baud/cable.')
+        self.get_logger().info(f'Heartbeat OK (sys={self.mav.target_system}, comp={self.mav.target_component})')
+
+        # Ask message rates (Hz)
+        self._set_message_rate('ATTITUDE_QUATERNION', 50)
+        self._set_message_rate('SCALED_IMU2', 100)
+        self._set_message_rate('SCALED_IMU', 100)   # fallback if IMU2 not sent
+        self._set_message_rate('LOCAL_POSITION_NED', 50)
+        self._set_message_rate('GPS_RAW_INT', 10)
+
+        # Latest state cache
+        self._last_accel_flu: Optional[Tuple[float,float,float]] = None
+        self._last_gyro_flu: Optional[Tuple[float,float,float]] = None
+        self._last_orientation_enu_flu: Optional[Tuple[float,float,float,float]] = None
+
+        self._last_pos_enu: Optional[Tuple[float,float,float]] = None
+        self._last_vel_enu: Optional[Tuple[float,float,float]] = None
+        self._last_angvel_flu: Optional[Tuple[float,float,float]] = None
+
+        self._last_gps_log = 0.0
+
+        # Timer loop
+        tick = 1.0 / float(self.get_parameter('publish_rate_hz').value)
+        self.create_timer(tick, self._spin_once)
+
+        self.get_logger().info('Node running.')
+
+    def _set_message_rate(self, msg_name: str, hz: float):
+        """Use MAV_CMD_SET_MESSAGE_INTERVAL to request a message at hz."""
         try:
-            self.mav = mavutil.mavlink_connection(
-                f'{serial_port}',
-                baud=baudrate,
-                source_system=255,
-                source_component=0,
-            )
-
-            # Wait for heartbeat
-            self.get_logger().info('Waiting for Pixhawk heartbeat...')
-            self.mav.wait_heartbeat(timeout=10)
-            self.get_logger().info(
-                'Heartbeat received from system %s, component %s',
-                self.mav.target_system,
-                self.mav.target_component,
-            )
-
-            # Request data streams
-            self.request_data_streams()
-
-        except Exception as exc:
-            self.get_logger().error(f'Error connecting to Pixhawk: {exc}')
-            raise
-
-        # Timer to read MAVLink messages
-        self.create_timer(0.01, self.read_mavlink)  # 100 Hz
-
-        # State for orientation / angular velocity (Pixhawk EKF)
-        self.current_orientation = None
-        self.current_angular_velocity = None
-        self.warned_odom_frame = False
-
-        self.get_logger().info('Pixhawk Reader started successfully')
-
-    def request_data_streams(self):
-        """Request data streams from Pixhawk."""
-        # IMU at 50 Hz
-        self.mav.mav.request_data_stream_send(
-            self.mav.target_system,
-            self.mav.target_component,
-            mavutil.mavlink.MAV_DATA_STREAM_RAW_SENSORS,
-            50,
-            1,
-        )
-
-        # GPS at 10 Hz
-        self.mav.mav.request_data_stream_send(
-            self.mav.target_system,
-            self.mav.target_component,
-            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-            10,
-            1,
-        )
-
-        # Quaternion attitude at ~50 Hz
-        self.mav.mav.request_data_stream_send(
-            self.mav.target_system,
-            self.mav.target_component,
-            mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
-            50,
-            1,
-        )
-
-        # EKF odometry via message interval (if supported)
-        try:
-            self._request_message_interval(
-                mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY,
-                50,
-            )
-        except Exception as exc:
-            self.get_logger().warning(
-                f'Unable to request ODOMETRY message interval: {exc}'
-            )
-
-        self.get_logger().info('Data streams requested')
-
-    def read_mavlink(self):
-        """Read MAVLink messages and publish ROS 2 topics."""
-        try:
-            msg = self.mav.recv_match(blocking=False)
-            if msg is None:
-                return
-
-            msg_type = msg.get_type()
-
-            # Raw IMU data (optional; disabled by default)
-            if msg_type in ('SCALED_IMU', 'SCALED_IMU2'):
-                if self.use_raw_imu:
-                    self.publish_imu(msg)
-            # Attitude quaternion
-            elif msg_type == 'ATTITUDE_QUATERNION':
-                self.publish_attitude(msg)
-            # EKF odometry (pose/velocity)
-            elif msg_type == 'ODOMETRY':
-                if self.use_mavlink_odometry:
-                    self.publish_mavlink_odometry(msg)
-            # Local position/velocity in NED
-            elif msg_type == 'LOCAL_POSITION_NED':
-                if not self.use_mavlink_odometry:
-                    self.publish_local_velocity(msg)
-            # GPS data
-            elif msg_type == 'GPS_RAW_INT':
-                self.publish_gps(msg)
-
-        except Exception as exc:
-            self.get_logger().error(f'Error reading MAVLink: {exc}')
-
-    def publish_imu(self, msg):
-        """Publish IMU data."""
-        imu_msg = Imu()
-
-        imu_msg.header = Header()
-        imu_msg.header.stamp = self.get_clock().now().to_msg()
-        imu_msg.header.frame_id = self.frame_id_imu
-
-        # Linear acceleration: milli-g to m/s^2. FRD -> FLU.
-        imu_msg.linear_acceleration.x = msg.xacc / 1000.0 * 9.81
-        imu_msg.linear_acceleration.y = -msg.yacc / 1000.0 * 9.81
-        imu_msg.linear_acceleration.z = -msg.zacc / 1000.0 * 9.81
-
-        # Angular velocity: milli-rad/s to rad/s. FRD -> FLU.
-        imu_msg.angular_velocity.x = msg.xgyro / 1000.0
-        imu_msg.angular_velocity.y = -msg.ygyro / 1000.0
-        imu_msg.angular_velocity.z = -msg.zgyro / 1000.0
-
-        # Covariances (tune if needed)
-        imu_msg.linear_acceleration_covariance = [
-            0.01, 0.0, 0.0,
-            0.0, 0.01, 0.0,
-            0.0, 0.0, 0.01,
-        ]
-
-        imu_msg.angular_velocity_covariance = [
-            0.001, 0.0, 0.0,
-            0.0, 0.001, 0.0,
-            0.0, 0.0, 0.001,
-        ]
-
-        # Orientation not provided here
-        imu_msg.orientation_covariance[0] = -1
-
-        self.imu_pub.publish(imu_msg)
-
-    def publish_attitude(self, msg):
-        """Publish IMU orientation from ATTITUDE_QUATERNION."""
-        imu_msg = Imu()
-
-        imu_msg.header = Header()
-        imu_msg.header.stamp = self.get_clock().now().to_msg()
-        imu_msg.header.frame_id = self.frame_id_imu
-
-        # Orientation: Pixhawk NED -> ROS ENU.
-        q_ned = (msg.q1, msg.q2, msg.q3, msg.q4)
-        q_enu = self._quat_ned_to_enu(q_ned)
-        imu_msg.orientation.w = q_enu[0]
-        imu_msg.orientation.x = q_enu[1]
-        imu_msg.orientation.y = q_enu[2]
-        imu_msg.orientation.z = q_enu[3]
-
-        # Angular velocity: FRD -> FLU.
-        imu_msg.angular_velocity.x = msg.rollspeed
-        imu_msg.angular_velocity.y = -msg.pitchspeed
-        imu_msg.angular_velocity.z = -msg.yawspeed
-
-        # Covariances (tune if needed)
-        imu_msg.orientation_covariance = [
-            0.01, 0.0, 0.0,
-            0.0, 0.01, 0.0,
-            0.0, 0.0, 0.01,
-        ]
-
-        imu_msg.angular_velocity_covariance = [
-            0.001, 0.0, 0.0,
-            0.0, 0.001, 0.0,
-            0.0, 0.0, 0.001,
-        ]
-
-        # Linear acceleration not available here
-        imu_msg.linear_acceleration_covariance[0] = -1
-
-        self.imu_pub.publish(imu_msg)
-        self.current_orientation = imu_msg.orientation
-        self.current_angular_velocity = imu_msg.angular_velocity
-
-    def publish_gps(self, msg):
-        """Publish GPS data."""
-        gps_msg = NavSatFix()
-
-        gps_msg.header = Header()
-        gps_msg.header.stamp = self.get_clock().now().to_msg()
-        gps_msg.header.frame_id = self.frame_id_gps
-
-        # GPS position: lat/lon in deg, alt in meters
-        gps_msg.latitude = msg.lat / 1e7
-        gps_msg.longitude = msg.lon / 1e7
-        gps_msg.altitude = msg.alt / 1000.0
-
-        # Status
-        gps_msg.status.status = (
-            NavSatStatus.STATUS_FIX if msg.fix_type >= 3 else NavSatStatus.STATUS_NO_FIX
-        )
-        gps_msg.status.service = NavSatStatus.SERVICE_GPS
-
-        # Covariance based on eph/epv (cm -> m)
-        eph_m = msg.eph / 100.0 if msg.eph != 65535 else 10.0
-        epv_m = msg.epv / 100.0 if msg.epv != 65535 else 10.0
-
-        gps_msg.position_covariance = [
-            eph_m**2, 0.0, 0.0,
-            0.0, eph_m**2, 0.0,
-            0.0, 0.0, epv_m**2,
-        ]
-        gps_msg.position_covariance_type = NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN
-
-        self.gps_pub.publish(gps_msg)
-
-        # Log every 5 seconds
-        if int(time.time()) % 5 == 0:
-            self.get_logger().info(
-                'GPS: lat=%.6f, lon=%.6f, alt=%.1fm, fix_type=%s, sats=%s',
-                gps_msg.latitude,
-                gps_msg.longitude,
-                gps_msg.altitude,
-                msg.fix_type,
-                msg.satellites_visible,
-            )
-
-    def publish_local_velocity(self, msg):
-        """Publish global velocity (ENU) using Pixhawk LOCAL_POSITION_NED."""
-        # Velocity in NED (m/s)
-        vx_n = msg.vx
-        vy_e = msg.vy
-        vz_d = msg.vz
-
-        # Convert to ENU (ROS): x=East, y=North, z=Up
-        vel_world_x = vy_e
-        vel_world_y = vx_n
-        vel_world_z = -vz_d
-
-        vel_msg = TwistStamped()
-        vel_msg.header = Header()
-        vel_msg.header.stamp = self.get_clock().now().to_msg()
-        vel_msg.header.frame_id = self.odom_frame
-        vel_msg.twist.linear.x = vel_world_x
-        vel_msg.twist.linear.y = vel_world_y
-        vel_msg.twist.linear.z = vel_world_z
-
-        if self.current_angular_velocity is not None:
-            vel_msg.twist.angular = self.current_angular_velocity
-
-        self.velocity_pub.publish(vel_msg)
-
-        # Position in NED (m)
-        pos_n = msg.x
-        pos_e = msg.y
-        pos_d = msg.z
-
-        # Convert to ENU
-        pos_world_x = pos_e
-        pos_world_y = pos_n
-        pos_world_z = -pos_d
-
-        odom_msg = Odometry()
-        odom_msg.header = vel_msg.header
-        odom_msg.header.frame_id = self.odom_frame
-        odom_msg.child_frame_id = self.base_link_frame
-        odom_msg.pose.pose.position.x = pos_world_x
-        odom_msg.pose.pose.position.y = pos_world_y
-        odom_msg.pose.pose.position.z = pos_world_z
-        if self.current_orientation is not None:
-            odom_msg.pose.pose.orientation = self.current_orientation
-        else:
-            odom_msg.pose.pose.orientation.w = 1.0
-
-        if self.current_orientation is not None:
-            yaw = self._quat_to_yaw(self.current_orientation)
-            cos_yaw = math.cos(yaw)
-            sin_yaw = math.sin(yaw)
-            vel_body_x = vel_world_x * cos_yaw + vel_world_y * sin_yaw
-            vel_body_y = -vel_world_x * sin_yaw + vel_world_y * cos_yaw
-        else:
-            vel_body_x = vel_world_x
-            vel_body_y = vel_world_y
-
-        odom_msg.twist.twist.linear.x = vel_body_x
-        odom_msg.twist.twist.linear.y = vel_body_y
-        odom_msg.twist.twist.linear.z = vel_world_z
-        if self.current_angular_velocity is not None:
-            odom_msg.twist.twist.angular = self.current_angular_velocity
-
-        self.odom_pub.publish(odom_msg)
-
-    def publish_mavlink_odometry(self, msg):
-        """Publish odometry using MAVLink ODOMETRY (EKF state)."""
-        # NOTE: Most Pixhawk setups publish MAV_FRAME_LOCAL_NED. Convert to ENU.
-        if msg.frame_id != mavutil.mavlink.MAV_FRAME_LOCAL_NED:
-            if not self.warned_odom_frame:
-                self.get_logger().warning(
-                    'ODOMETRY frame_id=%s not LOCAL_NED; conversion may be wrong.',
-                    msg.frame_id,
-                )
-                self.warned_odom_frame = True
-
-        pos_n = msg.x
-        pos_e = msg.y
-        pos_d = msg.z
-
-        pos_world_x = pos_e
-        pos_world_y = pos_n
-        pos_world_z = -pos_d
-
-        # Orientation: NED -> ENU.
-        q_ned = (msg.q1, msg.q2, msg.q3, msg.q4)
-        q_enu = self._quat_ned_to_enu(q_ned)
-
-        # Velocity in NED (m/s) -> ENU (world)
-        vx_n = msg.vx
-        vy_e = msg.vy
-        vz_d = msg.vz
-        vel_world_x = vy_e
-        vel_world_y = vx_n
-        vel_world_z = -vz_d
-
-        odom_msg = Odometry()
-        odom_msg.header = Header()
-        odom_msg.header.stamp = self.get_clock().now().to_msg()
-        odom_msg.header.frame_id = self.odom_frame
-        odom_msg.child_frame_id = self.base_link_frame
-        odom_msg.pose.pose.position.x = pos_world_x
-        odom_msg.pose.pose.position.y = pos_world_y
-        odom_msg.pose.pose.position.z = pos_world_z
-        odom_msg.pose.pose.orientation.w = q_enu[0]
-        odom_msg.pose.pose.orientation.x = q_enu[1]
-        odom_msg.pose.pose.orientation.y = q_enu[2]
-        odom_msg.pose.pose.orientation.z = q_enu[3]
-
-        # Covariances: MAVLink uses a 6x6 upper-triangular array (21 values).
-        if len(msg.pose_covariance) == 21:
-            odom_msg.pose.covariance = self._unpack_upper_triangular(msg.pose_covariance)
-        if len(msg.velocity_covariance) == 21:
-            odom_msg.twist.covariance = self._unpack_upper_triangular(msg.velocity_covariance)
-
-        # Twist in body frame is not guaranteed; publish world-frame linear velocity.
-        odom_msg.twist.twist.linear.x = vel_world_x
-        odom_msg.twist.twist.linear.y = vel_world_y
-        odom_msg.twist.twist.linear.z = vel_world_z
-        odom_msg.twist.twist.angular.x = msg.rollspeed
-        odom_msg.twist.twist.angular.y = msg.pitchspeed
-        odom_msg.twist.twist.angular.z = msg.yawspeed
-
-        self.odom_pub.publish(odom_msg)
-
-        vel_msg = TwistStamped()
-        vel_msg.header = odom_msg.header
-        vel_msg.twist.linear.x = vel_world_x
-        vel_msg.twist.linear.y = vel_world_y
-        vel_msg.twist.linear.z = vel_world_z
-        vel_msg.twist.angular.x = msg.rollspeed
-        vel_msg.twist.angular.y = msg.pitchspeed
-        vel_msg.twist.angular.z = msg.yawspeed
-        self.velocity_pub.publish(vel_msg)
-
-    @staticmethod
-    def _quat_to_yaw(q) -> float:
-        """Convert quaternion to yaw (assumes planar motion)."""
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
-
-    def _request_message_interval(self, message_id: int, rate_hz: float):
-        """Request a MAVLink message at a specific rate using command_long."""
-        if rate_hz <= 0:
+            msg_id = getattr(mavutil.mavlink, f'MAVLINK_MSG_ID_{msg_name}')
+        except AttributeError:
+            # Some dialects might not include the constant
             return
-        interval_us = int(1_000_000 / rate_hz)
+
+        # Interval in microseconds. 0 disables, -1 default.
+        interval_us = int(1e6 / hz) if hz > 0 else 0
         self.mav.mav.command_long_send(
             self.mav.target_system,
             self.mav.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
-            message_id,
+            msg_id,
             interval_us,
-            0,
-            0,
-            0,
-            0,
-            0,
+            0, 0, 0, 0, 0
         )
 
-    @staticmethod
-    def _quat_multiply(q1, q2):
-        """Multiply two quaternions (w, x, y, z)."""
-        w1, x1, y1, z1 = q1
-        w2, x2, y2, z2 = q2
-        return (
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        )
+    def _spin_once(self):
+        # Drain a few MAVLink messages per tick to keep up
+        for _ in range(50):
+            msg = self.mav.recv_match(blocking=False)
+            if msg is None:
+                break
 
-    @classmethod
-    def _quat_ned_to_enu(cls, q_ned):
-        """Convert quaternion from NED to ENU."""
-        q_enu_ned = (0.0, math.sqrt(0.5), math.sqrt(0.5), 0.0)
-        q_enu = cls._quat_multiply(q_enu_ned, q_ned)
-        norm = math.sqrt(sum(c * c for c in q_enu))
-        if norm == 0.0:
-            return (1.0, 0.0, 0.0, 0.0)
-        return tuple(c / norm for c in q_enu)
+            t = msg.get_type()
+            if t in ('SCALED_IMU2', 'SCALED_IMU'):
+                self._handle_scaled_imu(msg)
+            elif t == 'ATTITUDE_QUATERNION':
+                self._handle_attitude_quaternion(msg)
+            elif t == 'LOCAL_POSITION_NED':
+                self._handle_local_position_ned(msg)
+            elif t == 'GPS_RAW_INT':
+                self._handle_gps_raw_int(msg)
 
-    @staticmethod
-    def _unpack_upper_triangular(upper_tri):
-        """Convert 6x6 upper-triangular (21) to full row-major (36)."""
-        cov = [0.0] * 36
-        idx = 0
-        for row in range(6):
-            for col in range(row, 6):
-                cov[row * 6 + col] = upper_tri[idx]
-                cov[col * 6 + row] = upper_tri[idx]
-                idx += 1
-        return cov
+        # Publish combined outputs when possible
+        self._publish_imu_if_ready()
+        self._publish_odom_if_ready()
+
+    def _handle_scaled_imu(self, msg):
+        # accel in mg -> m/s^2, gyro in mrad/s -> rad/s
+        # msg fields: xacc,yacc,zacc (mg), xgyro,ygyro,zgyro (mrad/s)
+        ax_frd = (msg.xacc / 1000.0) * 9.80665
+        ay_frd = (msg.yacc / 1000.0) * 9.80665
+        az_frd = (msg.zacc / 1000.0) * 9.80665
+
+        gx_frd = (msg.xgyro / 1000.0)
+        gy_frd = (msg.ygyro / 1000.0)
+        gz_frd = (msg.zgyro / 1000.0)
+
+        # body FRD -> FLU
+        self._last_accel_flu = vec_frd_to_flu((ax_frd, ay_frd, az_frd))
+        self._last_gyro_flu  = vec_frd_to_flu((gx_frd, gy_frd, gz_frd))
+
+    def _handle_attitude_quaternion(self, msg):
+        # MAVLink ATTITUDE_QUATERNION: q1,q2,q3,q4 correspond to w,x,y,z
+        q_ned_frd = quat_norm((msg.q1, msg.q2, msg.q3, msg.q4))
+        q_enu_flu = quat_ned_frd_to_enu_flu(q_ned_frd)
+        self._last_orientation_enu_flu = q_enu_flu
+
+        # Angular rates in rad/s (rollspeed,pitchspeed,yawspeed) are body rates.
+        # They are in FRD convention. Convert to FLU.
+        self._last_angvel_flu = vec_frd_to_flu((msg.rollspeed, msg.pitchspeed, msg.yawspeed))
+
+    def _handle_local_position_ned(self, msg):
+        # Position and velocity in NED (meters, m/s)
+        pos_ned = (msg.x, msg.y, msg.z)      # x=N, y=E, z=D
+        vel_ned = (msg.vx, msg.vy, msg.vz)   # vx=N, vy=E, vz=D
+
+        self._last_pos_enu = vec_ned_to_enu(pos_ned)
+        self._last_vel_enu = vec_ned_to_enu(vel_ned)
+
+    def _handle_gps_raw_int(self, msg):
+        gps = NavSatFix()
+        gps.header.stamp = self.get_clock().now().to_msg()
+        gps.header.frame_id = self.gps_frame
+
+        gps.latitude = msg.lat / 1e7
+        gps.longitude = msg.lon / 1e7
+        gps.altitude = msg.alt / 1000.0
+
+        gps.status.status = NavSatStatus.STATUS_FIX if msg.fix_type >= 3 else NavSatStatus.STATUS_NO_FIX
+        gps.status.service = NavSatStatus.SERVICE_GPS
+
+        eph_m = (msg.eph / 100.0) if getattr(msg, 'eph', 65535) != 65535 else 10.0
+        epv_m = (msg.epv / 100.0) if getattr(msg, 'epv', 65535) != 65535 else 10.0
+        gps.position_covariance = [
+            eph_m*eph_m, 0.0,      0.0,
+            0.0,      eph_m*eph_m, 0.0,
+            0.0,      0.0,      epv_m*epv_m
+        ]
+        gps.position_covariance_type = NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN
+
+        self.pub_gps.publish(gps)
+
+        now = time.time()
+        if now - self._last_gps_log > 5.0:
+            self._last_gps_log = now
+            self.get_logger().info(
+                f'GPS fix={msg.fix_type} sats={msg.satellites_visible} '
+                f'lat={gps.latitude:.6f} lon={gps.longitude:.6f} alt={gps.altitude:.1f}m'
+            )
+
+    def _publish_imu_if_ready(self):
+        if self._last_accel_flu is None or self._last_gyro_flu is None:
+            return
+
+        imu = Imu()
+        imu.header.stamp = self.get_clock().now().to_msg()
+        imu.header.frame_id = self.imu_frame
+
+        ax, ay, az = self._last_accel_flu
+        gx, gy, gz = self._last_gyro_flu
+
+        imu.linear_acceleration.x = ax
+        imu.linear_acceleration.y = ay
+        imu.linear_acceleration.z = az
+
+        imu.angular_velocity.x = gx
+        imu.angular_velocity.y = gy
+        imu.angular_velocity.z = gz
+
+        if self._last_orientation_enu_flu is not None:
+            imu.orientation = ros_quat_from_tuple(self._last_orientation_enu_flu)
+            imu.orientation_covariance = [
+                0.01, 0.0,  0.0,
+                0.0,  0.01, 0.0,
+                0.0,  0.0,  0.01
+            ]
+        else:
+            imu.orientation_covariance[0] = -1.0
+
+        imu.angular_velocity_covariance = [
+            0.001, 0.0,   0.0,
+            0.0,   0.001, 0.0,
+            0.0,   0.0,   0.001
+        ]
+        imu.linear_acceleration_covariance = [
+            0.02, 0.0,  0.0,
+            0.0,  0.02, 0.0,
+            0.0,  0.0,  0.02
+        ]
+
+        self.pub_imu.publish(imu)
+
+    def _publish_odom_if_ready(self):
+        if self._last_pos_enu is None or self._last_vel_enu is None:
+            return
+
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = self.odom_frame
+        odom.child_frame_id = self.base_link_frame
+
+        px, py, pz = self._last_pos_enu
+        odom.pose.pose.position.x = px
+        odom.pose.pose.position.y = py
+        odom.pose.pose.position.z = pz
+
+        if self._last_orientation_enu_flu is not None:
+            odom.pose.pose.orientation = ros_quat_from_tuple(self._last_orientation_enu_flu)
+        else:
+            odom.pose.pose.orientation.w = 1.0
+
+        # Twist: express linear velocity in base_link (FLU) for common ROS tooling expectations
+        vx_e, vy_n, vz_u = self._last_vel_enu  # world ENU
+        if self._last_orientation_enu_flu is not None:
+            # Convert world vel -> body vel: v_body = R^T * v_world
+            q = self._last_orientation_enu_flu
+            # Using quaternion inverse to rotate into body frame
+            v_body = rotvec_by_quat((vx_e, vy_n, vz_u), quat_conj(q))
+            odom.twist.twist.linear.x = v_body[0]
+            odom.twist.twist.linear.y = v_body[1]
+            odom.twist.twist.linear.z = v_body[2]
+        else:
+            odom.twist.twist.linear.x = vx_e
+            odom.twist.twist.linear.y = vy_n
+            odom.twist.twist.linear.z = vz_u
+
+        if self._last_angvel_flu is not None:
+            wx, wy, wz = self._last_angvel_flu
+            odom.twist.twist.angular.x = wx
+            odom.twist.twist.angular.y = wy
+            odom.twist.twist.angular.z = wz
+
+        self.pub_odom.publish(odom)
+
+        vel = TwistStamped()
+        vel.header = odom.header
+        vel.header.frame_id = self.base_link_frame
+        vel.twist = odom.twist.twist
+        self.pub_vel.publish(vel)
 
 
 def main(args=None):
     rclpy.init(args=args)
-
+    node = None
     try:
-        node = PixhawkReader()
+        node = PixhawkMavlinkNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    except Exception as exc:
-        print(f'Error: {exc}')
     finally:
-        if rclpy.ok():
-            rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -182,6 +182,8 @@
     <script>
       const el = (id) => document.getElementById(id);
       const lastStamp = { value: null };
+      let ws = null;
+      let wsConnected = false;
 
       function fmt(value, digits = 3) {
         if (value === null || value === undefined) return "--";
@@ -209,44 +211,7 @@
           const res = await fetch("/data", { cache: "no-store" });
           const data = await res.json();
           updateConnection(true);
-
-          if (data.imu) {
-            el("imu-qw").textContent = fmt(data.imu.orientation.w, 4);
-            el("imu-qx").textContent = fmt(data.imu.orientation.x, 4);
-            el("imu-qy").textContent = fmt(data.imu.orientation.y, 4);
-            el("imu-qz").textContent = fmt(data.imu.orientation.z, 4);
-            el("imu-gx").textContent = fmt(data.imu.angular_velocity.x, 4);
-            el("imu-gy").textContent = fmt(data.imu.angular_velocity.y, 4);
-            el("imu-gz").textContent = fmt(data.imu.angular_velocity.z, 4);
-            lastStamp.value = data.imu.stamp || lastStamp.value;
-          }
-
-          if (data.gps) {
-            el("gps-lat").textContent = fmt(data.gps.latitude, 6);
-            el("gps-lon").textContent = fmt(data.gps.longitude, 6);
-            el("gps-alt").innerHTML = fmt(data.gps.altitude, 2) + ' <span class="units">m</span>';
-            el("gps-status").textContent = data.gps.status;
-            lastStamp.value = data.gps.stamp || lastStamp.value;
-          }
-
-          if (data.velocity) {
-            el("vel-x").innerHTML = fmt(data.velocity.linear.x, 3) + ' <span class="units">m/s</span>';
-            el("vel-y").innerHTML = fmt(data.velocity.linear.y, 3) + ' <span class="units">m/s</span>';
-            el("vel-z").innerHTML = fmt(data.velocity.linear.z, 3) + ' <span class="units">m/s</span>';
-            el("vel-yaw").innerHTML = fmt(data.velocity.angular.z, 3) + ' <span class="units">rad/s</span>';
-            lastStamp.value = data.velocity.stamp || lastStamp.value;
-          }
-
-          if (data.odom) {
-            el("odom-x").innerHTML = fmt(data.odom.position.x, 3) + ' <span class="units">m</span>';
-            el("odom-y").innerHTML = fmt(data.odom.position.y, 3) + ' <span class="units">m</span>';
-            el("odom-z").innerHTML = fmt(data.odom.position.z, 3) + ' <span class="units">m</span>';
-            el("odom-qw").textContent = fmt(data.odom.orientation.w, 4);
-            el("odom-qx").textContent = fmt(data.odom.orientation.x, 4);
-            el("odom-qy").textContent = fmt(data.odom.orientation.y, 4);
-            el("odom-qz").textContent = fmt(data.odom.orientation.z, 4);
-            lastStamp.value = data.odom.stamp || lastStamp.value;
-          }
+          applyData(data);
         } catch (err) {
           updateConnection(false);
         } finally {
@@ -254,9 +219,91 @@
         }
       }
 
+      function applyData(data) {
+        if (data.imu) {
+          el("imu-qw").textContent = fmt(data.imu.orientation.w, 4);
+          el("imu-qx").textContent = fmt(data.imu.orientation.x, 4);
+          el("imu-qy").textContent = fmt(data.imu.orientation.y, 4);
+          el("imu-qz").textContent = fmt(data.imu.orientation.z, 4);
+          el("imu-gx").textContent = fmt(data.imu.angular_velocity.x, 4);
+          el("imu-gy").textContent = fmt(data.imu.angular_velocity.y, 4);
+          el("imu-gz").textContent = fmt(data.imu.angular_velocity.z, 4);
+          lastStamp.value = data.imu.stamp || lastStamp.value;
+        }
+
+        if (data.gps) {
+          el("gps-lat").textContent = fmt(data.gps.latitude, 6);
+          el("gps-lon").textContent = fmt(data.gps.longitude, 6);
+          el("gps-alt").innerHTML = fmt(data.gps.altitude, 2) + ' <span class="units">m</span>';
+          el("gps-status").textContent = data.gps.status;
+          lastStamp.value = data.gps.stamp || lastStamp.value;
+        }
+
+        if (data.velocity) {
+          el("vel-x").innerHTML = fmt(data.velocity.linear.x, 3) + ' <span class="units">m/s</span>';
+          el("vel-y").innerHTML = fmt(data.velocity.linear.y, 3) + ' <span class="units">m/s</span>';
+          el("vel-z").innerHTML = fmt(data.velocity.linear.z, 3) + ' <span class="units">m/s</span>';
+          el("vel-yaw").innerHTML = fmt(data.velocity.angular.z, 3) + ' <span class="units">rad/s</span>';
+          lastStamp.value = data.velocity.stamp || lastStamp.value;
+        }
+
+        if (data.odom) {
+          el("odom-x").innerHTML = fmt(data.odom.position.x, 3) + ' <span class="units">m</span>';
+          el("odom-y").innerHTML = fmt(data.odom.position.y, 3) + ' <span class="units">m</span>';
+          el("odom-z").innerHTML = fmt(data.odom.position.z, 3) + ' <span class="units">m</span>';
+          el("odom-qw").textContent = fmt(data.odom.orientation.w, 4);
+          el("odom-qx").textContent = fmt(data.odom.orientation.x, 4);
+          el("odom-qy").textContent = fmt(data.odom.orientation.y, 4);
+          el("odom-qz").textContent = fmt(data.odom.orientation.z, 4);
+          lastStamp.value = data.odom.stamp || lastStamp.value;
+        }
+      }
+
+      function connectWs() {
+        const host = window.location.hostname || "localhost";
+        const httpPort = window.location.port ? parseInt(window.location.port, 10) : 8000;
+        const wsPort = httpPort + 1;
+        const wsUrl = `ws://${host}:${wsPort}/ws`;
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          wsConnected = true;
+          updateConnection(true);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            applyData(data);
+            updateConnection(true);
+            updateAge();
+          } catch (err) {
+            updateConnection(false);
+          }
+        };
+
+        ws.onclose = () => {
+          wsConnected = false;
+          updateConnection(false);
+          setTimeout(connectWs, 1000);
+        };
+
+        ws.onerror = () => {
+          wsConnected = false;
+          updateConnection(false);
+          ws.close();
+        };
+      }
+
       updateConnection(false);
-      setInterval(poll, 250);
-      poll();
+      connectWs();
+      setInterval(() => {
+        if (!wsConnected) {
+          poll();
+        } else {
+          updateAge();
+        }
+      }, 250);
     </script>
   </body>
 </html>

@@ -3,6 +3,7 @@
 ROS 2 node that serves a local HTML dashboard and exposes Pixhawk data as JSON.
 """
 
+import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import Imu, NavSatFix
 from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
+import websockets
 
 
 def _stamp_to_float(stamp):
@@ -32,6 +34,8 @@ class PixhawkWebServer(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('http_host', '0.0.0.0')
         self.declare_parameter('http_port', 8000)
+        self.declare_parameter('ws_host', '0.0.0.0')
+        self.declare_parameter('ws_port', 8001)
         self.declare_parameter('html_path', '')
 
         imu_topic = self.get_parameter('imu_topic').value
@@ -40,6 +44,8 @@ class PixhawkWebServer(Node):
         odom_topic = self.get_parameter('odom_topic').value
         http_host = self.get_parameter('http_host').value
         http_port = self.get_parameter('http_port').value
+        ws_host = self.get_parameter('ws_host').value
+        ws_port = self.get_parameter('ws_port').value
         html_path = self.get_parameter('html_path').value
 
         if not html_path:
@@ -54,6 +60,10 @@ class PixhawkWebServer(Node):
             'velocity': None,
             'odom': None,
         }
+        self._ws_clients = set()
+        self._ws_loop = None
+        self._ws_server = None
+        self._ws_stop_event = None
 
         self.create_subscription(Imu, imu_topic, self._imu_cb, 20)
         self.create_subscription(NavSatFix, gps_topic, self._gps_cb, 20)
@@ -63,6 +73,11 @@ class PixhawkWebServer(Node):
         self._httpd = self._start_http_server(http_host, int(http_port))
         self.get_logger().info(
             f'Web server running at http://{http_host}:{http_port}'
+        )
+
+        self._start_ws_server(ws_host, int(ws_port))
+        self.get_logger().info(
+            f'WebSocket server running at ws://{ws_host}:{ws_port}/ws'
         )
 
     def _load_html(self, html_path: str) -> str:
@@ -107,6 +122,46 @@ class PixhawkWebServer(Node):
     def _get_snapshot(self) -> str:
         with self._data_lock:
             return json.dumps(self._data)
+
+    def _start_ws_server(self, host: str, port: int):
+        self._ws_loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=self._run_ws_loop, args=(host, port), daemon=True
+        )
+        thread.start()
+
+    def _run_ws_loop(self, host: str, port: int):
+        asyncio.set_event_loop(self._ws_loop)
+        self._ws_stop_event = asyncio.Event()
+        self._ws_loop.run_until_complete(self._ws_main(host, port))
+        self._ws_loop.close()
+
+    async def _ws_main(self, host: str, port: int):
+        async with websockets.serve(self._ws_handler, host, port):
+            self._ws_loop.create_task(self._ws_broadcast())
+            await self._ws_stop_event.wait()
+
+    async def _ws_handler(self, websocket):
+        self._ws_clients.add(websocket)
+        try:
+            async for _ in websocket:
+                pass
+        finally:
+            self._ws_clients.discard(websocket)
+
+    async def _ws_broadcast(self):
+        while True:
+            payload = self._get_snapshot()
+            if self._ws_clients:
+                stale = []
+                for ws in list(self._ws_clients):
+                    try:
+                        await ws.send(payload)
+                    except Exception:
+                        stale.append(ws)
+                for ws in stale:
+                    self._ws_clients.discard(ws)
+            await asyncio.sleep(0.25)
 
     def _imu_cb(self, msg: Imu):
         data = {
@@ -197,6 +252,9 @@ class PixhawkWebServer(Node):
         if hasattr(self, '_httpd') and self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
+        if self._ws_loop is not None:
+            if self._ws_stop_event is not None:
+                self._ws_loop.call_soon_threadsafe(self._ws_stop_event.set)
         super().destroy_node()
 
 
