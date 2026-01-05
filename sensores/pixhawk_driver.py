@@ -18,16 +18,21 @@ from pymavlink import mavutil
 
 class PixhawkReader(Node):
     def __init__(self):
-        super().__init__('pixhawk_driver')
+        super().__init__('sensores')
 
         # Parameters
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baudrate', 921600)
         self.declare_parameter('frame_id_imu', 'imu_link')
         self.declare_parameter('frame_id_gps', 'gps')
+        self.declare_parameter('imu_topic', '/imu/data')
+        self.declare_parameter('gps_topic', '/gps/fix')
+        self.declare_parameter('velocity_topic', '/velocity')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('odom_frame', 'odom')
-        self.declare_parameter('base_link_frame', 'base_footprint')
+        self.declare_parameter('base_link_frame', 'base_link')
+        self.declare_parameter('use_raw_imu', False)
+        self.declare_parameter('use_mavlink_odometry', True)
 
         serial_port = self.get_parameter('serial_port').value
         baudrate = self.get_parameter('baudrate').value
@@ -35,12 +40,17 @@ class PixhawkReader(Node):
         self.frame_id_gps = self.get_parameter('frame_id_gps').value
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_link_frame = self.get_parameter('base_link_frame').value
+        imu_topic = self.get_parameter('imu_topic').value
+        gps_topic = self.get_parameter('gps_topic').value
+        velocity_topic = self.get_parameter('velocity_topic').value
         odom_topic = self.get_parameter('odom_topic').value
+        self.use_raw_imu = self.get_parameter('use_raw_imu').value
+        self.use_mavlink_odometry = self.get_parameter('use_mavlink_odometry').value
 
         # Publishers
-        self.imu_pub = self.create_publisher(Imu, '/imu/data', 10)
-        self.gps_pub = self.create_publisher(NavSatFix, '/gps/fix', 10)
-        self.velocity_pub = self.create_publisher(TwistStamped, '/velocity', 10)
+        self.imu_pub = self.create_publisher(Imu, imu_topic, 10)
+        self.gps_pub = self.create_publisher(NavSatFix, gps_topic, 10)
+        self.velocity_pub = self.create_publisher(TwistStamped, velocity_topic, 10)
         self.odom_pub = self.create_publisher(Odometry, odom_topic, 10)
 
         # Connect to Pixhawk
@@ -77,6 +87,7 @@ class PixhawkReader(Node):
         # State for orientation / angular velocity (Pixhawk EKF)
         self.current_orientation = None
         self.current_angular_velocity = None
+        self.warned_odom_frame = False
 
         self.get_logger().info('Pixhawk Reader started successfully')
 
@@ -109,6 +120,17 @@ class PixhawkReader(Node):
             1,
         )
 
+        # EKF odometry via message interval (if supported)
+        try:
+            self._request_message_interval(
+                mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY,
+                50,
+            )
+        except Exception as exc:
+            self.get_logger().warning(
+                f'Unable to request ODOMETRY message interval: {exc}'
+            )
+
         self.get_logger().info('Data streams requested')
 
     def read_mavlink(self):
@@ -120,15 +142,21 @@ class PixhawkReader(Node):
 
             msg_type = msg.get_type()
 
-            # IMU data (SCALED_IMU or RAW_IMU)
+            # Raw IMU data (optional; disabled by default)
             if msg_type in ('SCALED_IMU', 'SCALED_IMU2'):
-                self.publish_imu(msg)
+                if self.use_raw_imu:
+                    self.publish_imu(msg)
             # Attitude quaternion
             elif msg_type == 'ATTITUDE_QUATERNION':
                 self.publish_attitude(msg)
+            # EKF odometry (pose/velocity)
+            elif msg_type == 'ODOMETRY':
+                if self.use_mavlink_odometry:
+                    self.publish_mavlink_odometry(msg)
             # Local position/velocity in NED
             elif msg_type == 'LOCAL_POSITION_NED':
-                self.publish_local_velocity(msg)
+                if not self.use_mavlink_odometry:
+                    self.publish_local_velocity(msg)
             # GPS data
             elif msg_type == 'GPS_RAW_INT':
                 self.publish_gps(msg)
@@ -321,12 +349,101 @@ class PixhawkReader(Node):
 
         self.odom_pub.publish(odom_msg)
 
+    def publish_mavlink_odometry(self, msg):
+        """Publish odometry using MAVLink ODOMETRY (EKF state)."""
+        # NOTE: Most Pixhawk setups publish MAV_FRAME_LOCAL_NED. Convert to ENU.
+        if msg.frame_id != mavutil.mavlink.MAV_FRAME_LOCAL_NED:
+            if not self.warned_odom_frame:
+                self.get_logger().warning(
+                    'ODOMETRY frame_id=%s not LOCAL_NED; conversion may be wrong.',
+                    msg.frame_id,
+                )
+                self.warned_odom_frame = True
+
+        pos_n = msg.x
+        pos_e = msg.y
+        pos_d = msg.z
+
+        pos_world_x = pos_e
+        pos_world_y = pos_n
+        pos_world_z = -pos_d
+
+        # Orientation: NED -> ENU.
+        q_ned = (msg.q1, msg.q2, msg.q3, msg.q4)
+        q_enu = self._quat_ned_to_enu(q_ned)
+
+        # Velocity in NED (m/s) -> ENU (world)
+        vx_n = msg.vx
+        vy_e = msg.vy
+        vz_d = msg.vz
+        vel_world_x = vy_e
+        vel_world_y = vx_n
+        vel_world_z = -vz_d
+
+        odom_msg = Odometry()
+        odom_msg.header = Header()
+        odom_msg.header.stamp = self.get_clock().now().to_msg()
+        odom_msg.header.frame_id = self.odom_frame
+        odom_msg.child_frame_id = self.base_link_frame
+        odom_msg.pose.pose.position.x = pos_world_x
+        odom_msg.pose.pose.position.y = pos_world_y
+        odom_msg.pose.pose.position.z = pos_world_z
+        odom_msg.pose.pose.orientation.w = q_enu[0]
+        odom_msg.pose.pose.orientation.x = q_enu[1]
+        odom_msg.pose.pose.orientation.y = q_enu[2]
+        odom_msg.pose.pose.orientation.z = q_enu[3]
+
+        # Covariances: MAVLink uses a 6x6 upper-triangular array (21 values).
+        if len(msg.pose_covariance) == 21:
+            odom_msg.pose.covariance = self._unpack_upper_triangular(msg.pose_covariance)
+        if len(msg.velocity_covariance) == 21:
+            odom_msg.twist.covariance = self._unpack_upper_triangular(msg.velocity_covariance)
+
+        # Twist in body frame is not guaranteed; publish world-frame linear velocity.
+        odom_msg.twist.twist.linear.x = vel_world_x
+        odom_msg.twist.twist.linear.y = vel_world_y
+        odom_msg.twist.twist.linear.z = vel_world_z
+        odom_msg.twist.twist.angular.x = msg.rollspeed
+        odom_msg.twist.twist.angular.y = msg.pitchspeed
+        odom_msg.twist.twist.angular.z = msg.yawspeed
+
+        self.odom_pub.publish(odom_msg)
+
+        vel_msg = TwistStamped()
+        vel_msg.header = odom_msg.header
+        vel_msg.twist.linear.x = vel_world_x
+        vel_msg.twist.linear.y = vel_world_y
+        vel_msg.twist.linear.z = vel_world_z
+        vel_msg.twist.angular.x = msg.rollspeed
+        vel_msg.twist.angular.y = msg.pitchspeed
+        vel_msg.twist.angular.z = msg.yawspeed
+        self.velocity_pub.publish(vel_msg)
+
     @staticmethod
     def _quat_to_yaw(q) -> float:
         """Convert quaternion to yaw (assumes planar motion)."""
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
+
+    def _request_message_interval(self, message_id: int, rate_hz: float):
+        """Request a MAVLink message at a specific rate using command_long."""
+        if rate_hz <= 0:
+            return
+        interval_us = int(1_000_000 / rate_hz)
+        self.mav.mav.command_long_send(
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            message_id,
+            interval_us,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
 
     @staticmethod
     def _quat_multiply(q1, q2):
@@ -349,6 +466,18 @@ class PixhawkReader(Node):
         if norm == 0.0:
             return (1.0, 0.0, 0.0, 0.0)
         return tuple(c / norm for c in q_enu)
+
+    @staticmethod
+    def _unpack_upper_triangular(upper_tri):
+        """Convert 6x6 upper-triangular (21) to full row-major (36)."""
+        cov = [0.0] * 36
+        idx = 0
+        for row in range(6):
+            for col in range(row, 6):
+                cov[row * 6 + col] = upper_tri[idx]
+                cov[col * 6 + row] = upper_tri[idx]
+                idx += 1
+        return cov
 
 
 def main(args=None):

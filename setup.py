@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'pixhawk_driver'
+package_name = 'sensores'
 
 setup(
     name=package_name,
@@ -18,7 +18,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'pixhawk_driver = pixhawk_driver.pixhawk_driver:main',
+            'sensores = sensores.pixhawk_driver:main',
         ],
     },
 )
