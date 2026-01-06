@@ -20,7 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'sensores = sensores.pixhawk_driver:main',
+            'pixhawk_driver = sensores.pixhawk_driver:main',
             'sensores_web = sensores.web_server:main',
         ],
     },

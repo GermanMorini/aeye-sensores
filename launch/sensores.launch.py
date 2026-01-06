@@ -7,8 +7,8 @@ def generate_launch_description():
         [
             Node(
                 package='sensores',
-                executable='sensores',
-                name='sensores',
+                executable='pixhawk_driver',
+                name='pixhawk_driver',
                 output='screen',
             ),
             Node(
