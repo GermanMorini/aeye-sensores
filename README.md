@@ -21,6 +21,17 @@ colcon build --packages-select sensores
 source install/setup.bash
 ```
 
+## LiDAR RS-LiDAR-16 (driver)
+Clonar los repositorios del driver y mensajes del LiDAR **dentro de** `src` (**importante**)
+
+Recuerda estar en el workspace de ROS:
+```bash
+git clone 'https://github.com/RoboSense-LiDAR/rslidar_msg' src/rslidar_msg
+git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git src/rslidar_sdk
+cd src/rslidar_sdk
+git submodule update --init --recursive
+```
+
 ## Ejecutar
 ```bash
 ros2 run sensores sensores
