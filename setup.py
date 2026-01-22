@@ -11,7 +11,11 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name, ['pixhawk_dashboard.html']),
-        ('share/' + package_name + '/launch', ['launch/sensores.launch.py']),
+        ('share/' + package_name + '/launch', [
+            'launch/pixhawk.launch.py',
+            'launch/rs16.launch.py',
+        ]),
+        ('share/' + package_name + '/config', ['config/rs16.yaml']),
     ],
     install_requires=['setuptools', 'websockets'],
     zip_safe=True,

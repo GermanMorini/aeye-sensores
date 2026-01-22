@@ -32,9 +32,29 @@ ros2 run sensores sensores_web
 ```
 Abrir en el navegador: `http://localhost:8000`.
 
-Lanzar ambos nodos:
+Lanzar ambos nodos (incluye servidor web):
 ```bash
-ros2 launch sensores sensores.launch.py
+ros2 launch sensores pixhawk.launch.py launch_web:=true
+```
+
+Solo el driver:
+```bash
+ros2 launch sensores pixhawk.launch.py
+```
+
+Lanzar LiDAR RS-LiDAR-16 (rslidar_sdk):
+```bash
+ros2 launch sensores rs16.launch.py
+```
+
+Lanzar LiDAR + RViz:
+```bash
+ros2 launch sensores rs16.launch.py rviz:=true
+```
+
+Usar un config personalizado:
+```bash
+ros2 launch sensores rs16.launch.py config_path:=/ruta/a/config.yaml
 ```
 
 Con parametros personalizados:
