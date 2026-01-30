@@ -8,7 +8,7 @@ lidar:
       lidar_type: RS16
       msop_port: 6699
       difop_port: 7788
-      host_address: 192.168.1.10
+      host_address: 0.0.0.0
       group_address: 0.0.0.0
       imu_port: 0
       user_layer_bytes: 0
@@ -29,5 +29,5 @@ lidar:
       ros_recv_packet_topic: /rslidar_packets
       ros_send_packet_topic: /rslidar_packets
       ros_send_imu_data_topic: /rslidar_imu_data
-      ros_send_point_cloud_topic: /rslidar_points
+      ros_send_point_cloud_topic: /scan_3d
       ros_queue_length: 30
