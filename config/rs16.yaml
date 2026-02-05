@@ -15,7 +15,7 @@ lidar:
       tail_layer_bytes: 0
       min_distance: 0.4
       max_distance: 20
-      use_lidar_clock: true
+      use_lidar_clock: false
       dense_points: true
       ts_first_point: true
       start_angle: 270
