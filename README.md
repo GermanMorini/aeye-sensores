@@ -8,12 +8,20 @@ estandar de ROS 2.
 - Lee MAVLink por puerto serie y solicita streams de datos.
 - Publica IMU en `/imu/data` y GPS en `/gps/fix`.
 - Publica velocidad en `/velocity` y odometria en `/odom`.
+- Lee odometria de ruedas por UART (sniffer) y publica `/wheel/odom`.
 - Convierte marcos: NED -> ENU y FRD -> FLU para compatibilidad ROS.
 - Incluye servidor web con WebSocket para visualizar telemetria.
 
 ## Dependencias
 - ROS 2 con `rclpy`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `std_msgs`.
 - `pymavlink` (paquete `python3-pymavlink`).
+- `pyserial` (paquete `python3-serial`).
+- `pigpio` + daemon `pigpiod` (para inversion de senal UART en software).
+
+Instalar dependencias de inversion por software:
+```bash
+sudo apt install -y pigpio python3-pigpio
+```
 
 ## Compilar
 ```bash
@@ -51,6 +59,31 @@ ros2 launch sensores pixhawk.launch.py launch_web:=true
 Solo el driver:
 ```bash
 ros2 launch sensores pixhawk.launch.py
+```
+
+Lanzar odometria de ruedas por UART:
+```bash
+sudo systemctl start pigpiod
+ros2 launch sensores wheel_odom.launch.py gpio_rx_pin:=5 baudrate:=2000
+```
+
+Ver en consola (estilo Arduino) que se esta recibiendo:
+```bash
+ros2 launch sensores wheel_odom.launch.py \
+  gpio_rx_pin:=5 baudrate:=2000 \
+  log_rx_frames:=true
+```
+
+Ver ademas el frame completo en hex:
+```bash
+ros2 launch sensores wheel_odom.launch.py \
+  gpio_rx_pin:=5 baudrate:=2000 \
+  log_rx_frames:=true log_raw_hex:=true
+```
+
+Lanzar Pixhawk + odometria de ruedas:
+```bash
+ros2 launch sensores pixhawk.launch.py launch_wheel_odom:=true wheel_gpio_rx_pin:=5
 ```
 
 Lanzar LiDAR RS-LiDAR-16 (rslidar_sdk):
@@ -92,6 +125,15 @@ ros2 run sensores sensores --ros-args \
 - `/odom` (`nav_msgs/Odometry`)
   - Pose en `odom_frame` (ENU) con `child_frame_id` en `base_link_frame`.
   - Usa `LOCAL_POSITION_NED` + actitud (EKF) convertido a ENU/FLU.
+- `/wheel/odom` (`nav_msgs/Odometry`)
+  - Odometria 1D integrada desde velocidad de ruedas decodificada por UART.
+  - Pose en `odom_frame` con `child_frame_id` en `base_link_frame`.
+- `/wheel/velocity` (`geometry_msgs/TwistStamped`)
+  - Velocidad lineal de ruedas en `base_link`.
+- `/wheel/speed_kmh` (`std_msgs/Float32`)
+  - Velocidad decodificada final en km/h.
+- `/wheel/throttle` (`std_msgs/Bool`)
+  - Estado de acelerador (`true` cuando byte 8 == `0x5B`).
 
 ## Parametros
 - `serial_port` (string, default `/dev/ttyACM0`)
@@ -101,6 +143,31 @@ ros2 run sensores sensores --ros-args \
 - `imu_frame` (string, default `imu_link`)
 - `gps_frame` (string, default `gps`)
 - `publish_rate_hz` (float, default `200.0`)
+
+## Parametros del nodo wheel_odom_uart
+- `rx_backend` (string, default `pigpio`) (`pigpio` o `serial`)
+- `serial_port` (string, default `/dev/ttyAMA2`)
+- `gpio_rx_pin` (int, default `5`) (GPIO RX para backend `pigpio`)
+- `baudrate` (int, default `2000`) (`2083` opcional)
+- `frame_gap_us` (int, default `12000`)
+- `poll_rate_hz` (float, default `500.0`)
+- `publish_rate_hz` (float, default `50.0`)
+- `invert_bytes` (bool, default `false`)
+- `log_rx_frames` (bool, default `false`) (imprime una linea por frame recibido)
+- `log_raw_hex` (bool, default `false`) (agrega payload de frame en hex)
+- `invert_signal` (bool, default `true`) (solo backend `pigpio`)
+- `pigpiod_host` (string, default `localhost`)
+- `pigpiod_port` (int, default `8888`)
+- `odom_topic` (string, default `/wheel/odom`)
+- `velocity_topic` (string, default `/wheel/velocity`)
+- `speed_topic` (string, default `/wheel/speed_kmh`)
+- `throttle_topic` (string, default `/wheel/throttle`)
+- `odom_frame` (string, default `odom`)
+- `base_link_frame` (string, default `base_footprint`)
+- `speed_scale` (float, default `1.0`)
+- `forward_sign` (float, default `1.0`)
+- `speed_timeout_s` (float, default `0.5`)
+- `use_throttle_gate` (bool, default `true`)
 
 ## Parametros del servidor web
 - `imu_topic` (string, default `/imu/data`)
@@ -121,6 +188,8 @@ ros2 run sensores sensores --ros-args \
 
 ## Notas y solucion de problemas
 - Verifica permisos del puerto serie (grupo `dialout` en Linux).
+- Para inversion de senal por software (backend `pigpio`), inicia `pigpiod`.
+- Si usas backend `serial`, `invert_signal=true` no esta soportado por `pyserial`.
 - El nodo espera un heartbeat de MAVLink; si no aparece en 10 s, revisa el
   puerto y el baudrate.
 - `/odom` y `/velocity` dependen de `LOCAL_POSITION_NED` (EKF). En ArduPilot
