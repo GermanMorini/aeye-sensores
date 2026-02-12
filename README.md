@@ -16,12 +16,6 @@ estandar de ROS 2.
 - ROS 2 con `rclpy`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `std_msgs`.
 - `pymavlink` (paquete `python3-pymavlink`).
 - `pyserial` (paquete `python3-serial`).
-- `pigpio` + daemon `pigpiod` (para inversion de senal UART en software).
-
-Instalar dependencias de inversion por software:
-```bash
-sudo apt install -y pigpio python3-pigpio
-```
 
 ## Compilar
 ```bash
@@ -63,27 +57,29 @@ ros2 launch sensores pixhawk.launch.py
 
 Lanzar odometria de ruedas por UART:
 ```bash
-sudo systemctl start pigpiod
-ros2 launch sensores wheel_odom.launch.py gpio_rx_pin:=5 baudrate:=2000
+ros2 launch sensores wheel_odom.launch.py \
+  rx_backend:=serial serial_port:=/dev/ttyAMA2 baudrate:=2000
 ```
 
 Ver en consola (estilo Arduino) que se esta recibiendo:
 ```bash
 ros2 launch sensores wheel_odom.launch.py \
-  gpio_rx_pin:=5 baudrate:=2000 \
+  rx_backend:=serial serial_port:=/dev/ttyAMA2 baudrate:=2000 \
   log_rx_frames:=true
 ```
 
 Ver ademas el frame completo en hex:
 ```bash
 ros2 launch sensores wheel_odom.launch.py \
-  gpio_rx_pin:=5 baudrate:=2000 \
+  rx_backend:=serial serial_port:=/dev/ttyAMA2 baudrate:=2000 \
   log_rx_frames:=true log_raw_hex:=true
 ```
 
 Lanzar Pixhawk + odometria de ruedas:
 ```bash
-ros2 launch sensores pixhawk.launch.py launch_wheel_odom:=true wheel_gpio_rx_pin:=5
+ros2 launch sensores pixhawk.launch.py \
+  launch_wheel_odom:=true \
+  wheel_rx_backend:=serial wheel_odom_port:=/dev/ttyAMA2
 ```
 
 Lanzar LiDAR RS-LiDAR-16 (rslidar_sdk):
@@ -145,9 +141,9 @@ ros2 run sensores sensores --ros-args \
 - `publish_rate_hz` (float, default `200.0`)
 
 ## Parametros del nodo wheel_odom_uart
-- `rx_backend` (string, default `pigpio`) (`pigpio` o `serial`)
+- `rx_backend` (string, default `serial`) (`serial` o `pigpio`)
 - `serial_port` (string, default `/dev/ttyAMA2`)
-- `gpio_rx_pin` (int, default `5`) (GPIO RX para backend `pigpio`)
+- `gpio_rx_pin` (int, default `5`) (solo backend `pigpio`)
 - `baudrate` (int, default `2000`) (`2083` opcional)
 - `frame_gap_us` (int, default `12000`)
 - `poll_rate_hz` (float, default `500.0`)
@@ -155,9 +151,9 @@ ros2 run sensores sensores --ros-args \
 - `invert_bytes` (bool, default `false`)
 - `log_rx_frames` (bool, default `false`) (imprime una linea por frame recibido)
 - `log_raw_hex` (bool, default `false`) (agrega payload de frame en hex)
-- `invert_signal` (bool, default `true`) (solo backend `pigpio`)
-- `pigpiod_host` (string, default `localhost`)
-- `pigpiod_port` (int, default `8888`)
+- `invert_signal` (bool, default `false`) (solo backend `pigpio`)
+- `pigpiod_host` (string, default `localhost`) (solo backend `pigpio`)
+- `pigpiod_port` (int, default `8888`) (solo backend `pigpio`)
 - `odom_topic` (string, default `/wheel/odom`)
 - `velocity_topic` (string, default `/wheel/velocity`)
 - `speed_topic` (string, default `/wheel/speed_kmh`)
@@ -188,8 +184,9 @@ ros2 run sensores sensores --ros-args \
 
 ## Notas y solucion de problemas
 - Verifica permisos del puerto serie (grupo `dialout` en Linux).
-- Para inversion de senal por software (backend `pigpio`), inicia `pigpiod`.
-- Si usas backend `serial`, `invert_signal=true` no esta soportado por `pyserial`.
+- En `rx_backend:=serial`, `invert_signal=true` no esta soportado por `pyserial`.
+- Si la UART del display llega invertida, invierte la senal en hardware antes
+  del RX de la Raspberry Pi.
 - El nodo espera un heartbeat de MAVLink; si no aparece en 10 s, revisa el
   puerto y el baudrate.
 - `/odom` y `/velocity` dependen de `LOCAL_POSITION_NED` (EKF). En ArduPilot

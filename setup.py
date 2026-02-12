@@ -18,7 +18,7 @@ setup(
         ]),
         ('share/' + package_name + '/config', ['config/rs16.yaml']),
     ],
-    install_requires=['setuptools', 'websockets', 'pyserial', 'pigpio'],
+    install_requires=['setuptools', 'websockets', 'pyserial'],
     zip_safe=True,
     description='Pixhawk reader node that publishes ROS 2 topics via MAVLink',
     license='MIT',

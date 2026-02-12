@@ -54,8 +54,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 'wheel_rx_backend',
-                default_value='pigpio',
-                description='Wheel odometry backend: serial or pigpio',
+                default_value='serial',
+                description='Wheel odometry backend: serial (default) or pigpio',
             ),
             DeclareLaunchArgument(
                 'wheel_gpio_rx_pin',
@@ -84,7 +84,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 'wheel_odom_invert_signal',
-                default_value='true',
+                default_value='false',
                 description='Invert physical UART signal (pigpio backend)',
             ),
             DeclareLaunchArgument(

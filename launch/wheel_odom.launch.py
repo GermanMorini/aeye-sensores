@@ -34,7 +34,7 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument('rx_backend', default_value='pigpio', description='RX backend: serial or pigpio'),
+            DeclareLaunchArgument('rx_backend', default_value='serial', description='RX backend: serial (default) or pigpio'),
             DeclareLaunchArgument('serial_port', default_value='/dev/ttyAMA2', description='UART port for wheel sniffer stream'),
             DeclareLaunchArgument('gpio_rx_pin', default_value='5', description='GPIO pin for pigpio bit-bang UART RX'),
             DeclareLaunchArgument('baudrate', default_value='2000', description='UART baudrate (2000 or 2083)'),
@@ -42,7 +42,7 @@ def generate_launch_description():
             DeclareLaunchArgument('invert_bytes', default_value='false', description='Invert each received byte with bitwise NOT'),
             DeclareLaunchArgument('log_rx_frames', default_value='false', description='Print Arduino-like RX trace per frame'),
             DeclareLaunchArgument('log_raw_hex', default_value='false', description='Include full frame hex in RX trace'),
-            DeclareLaunchArgument('invert_signal', default_value='true', description='Invert physical UART signal (pigpio backend)'),
+            DeclareLaunchArgument('invert_signal', default_value='false', description='Invert physical UART signal (pigpio backend)'),
             DeclareLaunchArgument('pigpiod_host', default_value='localhost', description='pigpiod host'),
             DeclareLaunchArgument('pigpiod_port', default_value='8888', description='pigpiod TCP port'),
             DeclareLaunchArgument('poll_rate_hz', default_value='500.0', description='UART polling loop rate'),

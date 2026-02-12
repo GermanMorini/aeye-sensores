@@ -22,7 +22,7 @@ class WheelUartOdomNode(Node):
     def __init__(self) -> None:
         super().__init__('wheel_odom_uart')
 
-        self.declare_parameter('rx_backend', 'pigpio')
+        self.declare_parameter('rx_backend', 'serial')
         self.declare_parameter('serial_port', '/dev/ttyAMA2')
         self.declare_parameter('baudrate', 2000)
         self.declare_parameter('frame_gap_us', 12000)
@@ -33,7 +33,7 @@ class WheelUartOdomNode(Node):
         self.declare_parameter('invert_bytes', False)  # Debug-only, byte-level post decode.
         self.declare_parameter('log_rx_frames', False)  # Arduino-like RX trace per decoded frame.
         self.declare_parameter('log_raw_hex', False)  # Include full frame payload in hex when log_rx_frames=true.
-        self.declare_parameter('invert_signal', True)  # Physical UART logic inversion (pigpio backend).
+        self.declare_parameter('invert_signal', False)  # Physical UART logic inversion (pigpio backend).
         self.declare_parameter('gpio_rx_pin', 5)
         self.declare_parameter('pigpiod_host', 'localhost')
         self.declare_parameter('pigpiod_port', 8888)
@@ -106,7 +106,7 @@ class WheelUartOdomNode(Node):
             if self.invert_signal:
                 raise RuntimeError(
                     'invert_signal=true is not supported by Linux UART via pyserial. '
-                    'Use rx_backend:=pigpio for software inversion or external hardware inverter.'
+                    'Use an external hardware inverter before Raspberry Pi UART RX.'
                 )
             try:
                 self.serial = serial.Serial(
