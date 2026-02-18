@@ -8,7 +8,9 @@ estandar de ROS 2.
 - Lee MAVLink por puerto serie y solicita streams de datos.
 - Publica IMU en `/imu/data` y GPS en `/gps/fix`.
 - Publica velocidad en `/velocity` y odometria en `/odom`.
-- Lee odometria de ruedas por UART (sniffer) y publica `/wheel/odom`.
+- Lee odometria de ruedas por UART:
+  - modo legado `wheel_odom_uart` por sniffer crudo (`DEPRECATED`)
+  - nuevo contrato objetivo basado en protocolo ESP32->Raspberry
 - Convierte marcos: NED -> ENU y FRD -> FLU para compatibilidad ROS.
 - Incluye servidor web con WebSocket para visualizar telemetria.
 
@@ -16,6 +18,17 @@ estandar de ROS 2.
 - ROS 2 con `rclpy`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `std_msgs`.
 - `pymavlink` (paquete `python3-pymavlink`).
 - `pyserial` (paquete `python3-serial`).
+
+## Protocolo UART ESP32↔Raspberry (canónico)
+- Documento canónico: `ESP32_UART_PROTOCOL.md`.
+- Resumen corto para implementación ROS2: `ROS2_SPEED_SENSOR_UART_QUICKREF.md`.
+- Fuente de verdad: `src/sensores/ESP32_UART_PROTOCOL.md`.
+- Espejos sincronizados:
+  - `ESP32_SALUS/ESP32_UART_PROTOCOL.md`
+  - `RASPY_SALUS/ESP32_UART_PROTOCOL.md`
+- Política actual:
+  - `wheel_odom_uart` (sniffer `b16/b17`) se mantiene por compatibilidad, pero está `DEPRECATED`.
+  - El nuevo sensor ROS2 debe basarse en trama ESP32->Pi `0x55 status telemetry crc`.
 
 ## Compilar
 ```bash
@@ -55,20 +68,20 @@ Solo el driver:
 ros2 launch sensores pixhawk.launch.py
 ```
 
-Lanzar odometria de ruedas por UART:
+Lanzar odometria de ruedas por UART (legacy, `DEPRECATED`):
 ```bash
 ros2 launch sensores wheel_odom.launch.py \
   rx_backend:=serial serial_port:=/dev/ttyAMA2 baudrate:=2000
 ```
 
-Ver en consola (estilo Arduino) que se esta recibiendo:
+Ver en consola (estilo Arduino) que se esta recibiendo (legacy):
 ```bash
 ros2 launch sensores wheel_odom.launch.py \
   rx_backend:=serial serial_port:=/dev/ttyAMA2 baudrate:=2000 \
   log_rx_frames:=true
 ```
 
-Ver ademas el frame completo en hex:
+Ver ademas el frame completo en hex (legacy):
 ```bash
 ros2 launch sensores wheel_odom.launch.py \
   rx_backend:=serial serial_port:=/dev/ttyAMA2 baudrate:=2000 \
@@ -130,6 +143,7 @@ ros2 run sensores sensores --ros-args \
   - Velocidad decodificada final en km/h.
 - `/wheel/throttle` (`std_msgs/Bool`)
   - Estado de acelerador (`true` cuando byte 8 == `0x5B`).
+  - Topico legado, fuera del contrato canónico nuevo.
 
 ## Parametros
 - `serial_port` (string, default `/dev/ttyACM0`)
@@ -140,7 +154,7 @@ ros2 run sensores sensores --ros-args \
 - `gps_frame` (string, default `gps`)
 - `publish_rate_hz` (float, default `200.0`)
 
-## Parametros del nodo wheel_odom_uart
+## Parametros del nodo wheel_odom_uart (legacy, `DEPRECATED`)
 - `rx_backend` (string, default `serial`) (`serial` o `pigpio`)
 - `serial_port` (string, default `/dev/ttyAMA2`)
 - `gpio_rx_pin` (int, default `5`) (solo backend `pigpio`)
