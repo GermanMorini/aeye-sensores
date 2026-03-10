@@ -17,7 +17,7 @@ setup(
         ]),
         ('share/' + package_name + '/config', ['config/rs16.yaml']),
     ],
-    install_requires=['setuptools', 'websockets'],
+    install_requires=['setuptools', 'websockets', 'onvif-zeep'],
     zip_safe=True,
     description='Pixhawk reader node that publishes ROS 2 topics via MAVLink',
     license='MIT',
@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'pixhawk_driver = sensores.pixhawk_driver:main',
             'sensores_web = sensores.web_server:main',
+            'camara = sensores.camara:main',
         ],
     },
 )
