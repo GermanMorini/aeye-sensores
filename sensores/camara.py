@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 from typing import Dict
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
+from std_srvs.srv import Trigger
 
-from navegacion_gps_interfaces.srv import CameraPan, CameraStatus
+from interfaces.srv import CameraPan, CameraStatus
 
 try:
     from onvif import ONVIFCamera
@@ -113,16 +115,10 @@ class CamaraNode(Node):
         self.declare_parameter("camera_zoom_fixed_level", 0.5)
         self.declare_parameter("camera_zoom_zero_level", 0.0)
         self.declare_parameter("camera_zoom_initial_in", False)
-
-        self.declare_parameter("camera_preset_center", "1")
-        self.declare_parameter("camera_preset_0", "2")
-        self.declare_parameter("camera_preset_45", "3")
-        self.declare_parameter("camera_preset_90", "4")
-        self.declare_parameter("camera_preset_m45", "5")
-        self.declare_parameter("camera_preset_m90", "6")
-        self.declare_parameter("camera_preset_180", "7")
-        self.declare_parameter("camera_preset_135", "8")
-        self.declare_parameter("camera_preset_m135", "9")
+        self.declare_parameter("camera_pan_deg_min", 0.0)
+        self.declare_parameter("camera_pan_deg_max", 355.0)
+        self.declare_parameter("camera_onvif_pan_min", -1.0)
+        self.declare_parameter("camera_onvif_pan_max", 1.0)
 
         self._host = str(self.get_parameter("camera_host").value)
         self._port = int(self.get_parameter("camera_port").value)
@@ -133,22 +129,10 @@ class CamaraNode(Node):
         self._zoom_fixed_level = self._clamp_zoom(float(self.get_parameter("camera_zoom_fixed_level").value))
         self._zoom_zero_level = self._clamp_zoom(float(self.get_parameter("camera_zoom_zero_level").value))
         self._zoom_in = bool(self.get_parameter("camera_zoom_initial_in").value)
-
-        self._preset_param_key_by_command = {
-            "center": "camera_preset_center",
-            "angle_0": "camera_preset_0",
-            "angle_45": "camera_preset_45",
-            "angle_90": "camera_preset_90",
-            "angle_m45": "camera_preset_m45",
-            "angle_m90": "camera_preset_m90",
-            "angle_180": "camera_preset_180",
-            "angle_135": "camera_preset_135",
-            "angle_m135": "camera_preset_m135",
-        }
-        self._preset_token_by_command = {
-            command: str(self.get_parameter(param_key).value)
-            for command, param_key in self._preset_param_key_by_command.items()
-        }
+        self._pan_deg_min = float(self.get_parameter("camera_pan_deg_min").value)
+        self._pan_deg_max = float(self.get_parameter("camera_pan_deg_max").value)
+        self._onvif_pan_min = float(self.get_parameter("camera_onvif_pan_min").value)
+        self._onvif_pan_max = float(self.get_parameter("camera_onvif_pan_max").value)
 
         self._camera = None
         self._media_service = None
@@ -161,6 +145,11 @@ class CamaraNode(Node):
         self._connect_onvif()
 
         self.create_service(CameraPan, "/camara/camera_pan", self._on_camera_pan)
+        self.create_service(
+            Trigger,
+            "/camara/camera_zoom_toggle",
+            self._on_camera_zoom_toggle,
+        )
         self.create_service(CameraStatus, "/camara/camera_status", self._on_camera_status)
 
         self.get_logger().info(
@@ -236,29 +225,59 @@ class CamaraNode(Node):
     def _clamp_zoom(self, value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
+    def _clamp(self, value: float, lo: float, hi: float) -> float:
+        return max(float(lo), min(float(hi), float(value)))
+
+    def _normalize_angle_deg(self, angle_deg: float) -> float:
+        angle = math.fmod(float(angle_deg), 360.0)
+        if angle < 0.0:
+            angle += 360.0
+        return angle
+
+    def _angle_deg_to_onvif_pan(self, angle_deg: float) -> float:
+        deg_lo = min(self._pan_deg_min, self._pan_deg_max)
+        deg_hi = max(self._pan_deg_min, self._pan_deg_max)
+        clamped_deg = self._clamp(angle_deg, deg_lo, deg_hi)
+
+        deg_span = self._pan_deg_max - self._pan_deg_min
+        if abs(deg_span) < 1e-6:
+            raise RuntimeError("invalid pan mapping: camera_pan_deg_min == camera_pan_deg_max")
+
+        ratio = (clamped_deg - self._pan_deg_min) / deg_span
+        pan = self._onvif_pan_min + ratio * (self._onvif_pan_max - self._onvif_pan_min)
+        pan_lo = min(self._onvif_pan_min, self._onvif_pan_max)
+        pan_hi = max(self._onvif_pan_min, self._onvif_pan_max)
+        return self._clamp(pan, pan_lo, pan_hi)
+
     def _get_status(self):
         req = self._ptz_service.create_type("GetStatus")
         req.ProfileToken = self._profile_token
         return self._ptz_service.GetStatus(req)
 
-    def _goto_preset(self, command: str) -> tuple[bool, str]:
-        preset_token = self._preset_token_by_command.get(command, "")
-        if not preset_token:
-            param_key = self._preset_param_key_by_command.get(command, "<unknown>")
-            return (
-                False,
-                f"missing preset token for command={command} (ros param {param_key})",
-            )
-
-        req = self._ptz_service.create_type("GotoPreset")
-        req.ProfileToken = self._profile_token
-        req.PresetToken = preset_token
-
+    def _set_pan_absolute(self, angle_deg: float) -> tuple[bool, str]:
         try:
-            self._ptz_service.GotoPreset(req)
+            status = self._get_status()
+            position = getattr(status, "Position", None)
+            pan_tilt = getattr(position, "PanTilt", None) if position is not None else None
+            zoom = getattr(position, "Zoom", None) if position is not None else None
+
+            target_pan = self._angle_deg_to_onvif_pan(angle_deg)
+            current_tilt = 0.0
+            if pan_tilt is not None and hasattr(pan_tilt, "y"):
+                current_tilt = float(pan_tilt.y)
+
+            req = self._ptz_service.create_type("AbsoluteMove")
+            req.ProfileToken = self._profile_token
+
+            out_pos = {"PanTilt": {"x": float(target_pan), "y": float(current_tilt)}}
+            if zoom is not None and hasattr(zoom, "x"):
+                out_pos["Zoom"] = {"x": self._clamp_zoom(float(zoom.x))}
+            req.Position = out_pos
+
+            self._ptz_service.AbsoluteMove(req)
             return True, ""
         except Exception as exc:
-            return False, f"GotoPreset failed for {command}: {exc}"
+            return False, f"AbsoluteMove pan failed: {exc}"
 
     def _set_zoom_absolute(self, target_zoom: float) -> tuple[bool, str]:
         try:
@@ -307,30 +326,42 @@ class CamaraNode(Node):
     def _on_camera_pan(
         self, request: CameraPan.Request, response: CameraPan.Response
     ) -> CameraPan.Response:
-        command = str(request.command).strip().lower()
-        response.applied_command = command
-
-        if not command:
-            response.ok = False
-            response.error = "command is empty"
-            return response
-
         if not self._ready:
             response.ok = False
             response.error = self._ready_error or "camera is not ready"
+            response.applied_angle_deg = 0.0
             return response
 
-        if command == "zoom_toggle":
-            ok, err = self._zoom_toggle()
-        elif command in self._preset_token_by_command:
-            ok, err = self._goto_preset(command)
-        else:
-            ok, err = False, f"unknown command: {command}"
+        input_angle = float(request.angle_deg)
+        if not math.isfinite(input_angle):
+            response.ok = False
+            response.error = "angle_deg must be finite"
+            response.applied_angle_deg = 0.0
+            return response
+
+        applied_angle = self._normalize_angle_deg(input_angle)
+        ok, err = self._set_pan_absolute(applied_angle)
 
         response.ok = bool(ok)
         response.error = "" if ok else err
+        response.applied_angle_deg = float(applied_angle)
         if ok:
-            self._last_command = command
+            self._last_command = f"angle:{applied_angle:.1f}"
+        return response
+
+    def _on_camera_zoom_toggle(
+        self, _request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        if not self._ready:
+            response.success = False
+            response.message = self._ready_error or "camera is not ready"
+            return response
+
+        ok, err = self._zoom_toggle()
+        response.success = bool(ok)
+        response.message = "" if ok else err
+        if ok:
+            self._last_command = "zoom_toggle"
         return response
 
     def _on_camera_status(
