@@ -1,6 +1,22 @@
+from collections import defaultdict
+from pathlib import Path
+
 from setuptools import find_packages, setup
 
 package_name = 'sensores'
+
+
+def _wsdl_data_files():
+    wsdl_root = Path('wsdl')
+    grouped = defaultdict(list)
+    if wsdl_root.exists():
+        for path in wsdl_root.rglob('*'):
+            if not path.is_file():
+                continue
+            rel_parent = path.parent.relative_to(wsdl_root)
+            target = Path('share') / package_name / 'wsdl' / rel_parent
+            grouped[str(target)].append(str(path))
+    return sorted(grouped.items())
 
 setup(
     name=package_name,
@@ -16,7 +32,7 @@ setup(
             'launch/rs16.launch.py',
         ]),
         ('share/' + package_name + '/config', ['config/rs16.yaml']),
-    ],
+    ] + _wsdl_data_files(),
     install_requires=['setuptools', 'websockets', 'onvif-zeep'],
     zip_safe=True,
     description='Pixhawk reader node that publishes ROS 2 topics via MAVLink',

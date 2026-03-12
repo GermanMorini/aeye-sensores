@@ -58,6 +58,42 @@ def _resolve_default_env_file() -> Path:
         return Path(__file__).resolve().parents[2] / ".env"
 
 
+def _onvif_default_wsdl_dir() -> Path | None:
+    if ONVIFCamera is None:
+        return None
+    try:
+        defaults = getattr(ONVIFCamera.__init__, "__defaults__", None)
+        if defaults and isinstance(defaults[0], str):
+            return Path(defaults[0])
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_default_wsdl_dir() -> Path:
+    candidates = []
+    try:
+        share_dir = Path(get_package_share_directory("sensores"))
+        candidates.append(share_dir / "wsdl")
+        try:
+            workspace_root = share_dir.parents[3]
+            candidates.append(workspace_root / "src" / "sensores" / "wsdl")
+        except IndexError:
+            pass
+    except Exception:
+        pass
+
+    candidates.append(Path(__file__).resolve().parents[2] / "wsdl")
+    onvif_default = _onvif_default_wsdl_dir()
+    if onvif_default is not None:
+        candidates.append(onvif_default)
+
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / "devicemgmt.wsdl").exists():
+            return candidate
+    return candidates[0] if candidates else Path("wsdl")
+
+
 class CamaraNode(Node):
     def __init__(self) -> None:
         super().__init__("camara")
@@ -72,7 +108,7 @@ class CamaraNode(Node):
         self.declare_parameter("camera_user", self._env_cfg("CAMERA_USER", "admin"))
         self.declare_parameter("camera_pass", self._env_cfg("CAMERA_PASS", "CHANGE_ME"))
 
-        self.declare_parameter("camera_wsdl_dir", "")
+        self.declare_parameter("camera_wsdl_dir", str(_resolve_default_wsdl_dir()))
         self.declare_parameter("camera_profile_token", "")
         self.declare_parameter("camera_zoom_fixed_level", 0.5)
         self.declare_parameter("camera_zoom_zero_level", 0.0)
@@ -92,7 +128,7 @@ class CamaraNode(Node):
         self._port = int(self.get_parameter("camera_port").value)
         self._user = str(self.get_parameter("camera_user").value)
         self._password = str(self.get_parameter("camera_pass").value)
-        self._wsdl_dir = str(self.get_parameter("camera_wsdl_dir").value)
+        self._wsdl_dir = str(self.get_parameter("camera_wsdl_dir").value).strip()
         self._profile_token_cfg = str(self.get_parameter("camera_profile_token").value)
         self._zoom_fixed_level = self._clamp_zoom(float(self.get_parameter("camera_zoom_fixed_level").value))
         self._zoom_zero_level = self._clamp_zoom(float(self.get_parameter("camera_zoom_zero_level").value))
@@ -129,7 +165,7 @@ class CamaraNode(Node):
 
         self.get_logger().info(
             "camara node ready "
-            f"(env_file={self._env_file}, host={self._host}:{self._port}, onvif_ready={self._ready})"
+            f"(env_file={self._env_file}, host={self._host}:{self._port}, wsdl_dir={self._wsdl_dir}, onvif_ready={self._ready})"
         )
 
     def _env_cfg(self, key: str, default: str) -> str:
@@ -156,22 +192,29 @@ class CamaraNode(Node):
             self.get_logger().error(self._ready_error)
             return
 
+        wsdl_dir = Path(self._wsdl_dir) if self._wsdl_dir else _resolve_default_wsdl_dir()
+        wsdl_probe = wsdl_dir / "devicemgmt.wsdl"
+        if not wsdl_probe.exists():
+            self._ready = False
+            self._ready_error = (
+                f"ONVIF WSDL not found: {wsdl_probe}. "
+                "Set ROS param camera_wsdl_dir to a valid wsdl directory."
+            )
+            self.get_logger().error(self._ready_error)
+            return
+
         try:
-            if self._wsdl_dir:
-                self._camera = ONVIFCamera(
-                    self._host,
-                    self._port,
-                    self._user,
-                    self._password,
-                    self._wsdl_dir,
-                )
-            else:
-                self._camera = ONVIFCamera(
-                    self._host,
-                    self._port,
-                    self._user,
-                    self._password,
-                )
+            self.get_logger().info(
+                "Attempting ONVIF connection "
+                f"(host={self._host}, port={self._port}, user={self._user}, wsdl_dir={wsdl_dir})"
+            )
+            self._camera = ONVIFCamera(
+                self._host,
+                self._port,
+                self._user,
+                self._password,
+                str(wsdl_dir),
+            )
             self._media_service = self._camera.create_media_service()
             self._ptz_service = self._camera.create_ptz_service()
 
