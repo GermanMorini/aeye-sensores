@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -105,6 +106,16 @@ class CamaraNode(Node):
         self.declare_parameter("camera_zoom_fixed_level", 4.0)
         self.declare_parameter("camera_zoom_zero_level", 1.0)
         self.declare_parameter("camera_zoom_initial_in", False)
+        self.declare_parameter(
+            "camera_pan_cw_value", float(self._env_cfg("CAMERA_PAN_CW_VALUE", "-80"))
+        )
+        self.declare_parameter(
+            "camera_pan_ccw_value", float(self._env_cfg("CAMERA_PAN_CCW_VALUE", "80"))
+        )
+        self.declare_parameter("camera_pan_tolerance_deg", 2.0)
+        self.declare_parameter("camera_pan_wait_max_s", 12.0)
+        self.declare_parameter("camera_pan_poll_s", 0.12)
+        self.declare_parameter("camera_pan_overshoot_deg", 5.0)
 
         self._host = str(self.get_parameter("camera_host").value)
         self._port = int(self.get_parameter("camera_port").value)
@@ -134,6 +145,18 @@ class CamaraNode(Node):
         )
         self._absolute_url = f"{self._base_url}/absoluteEx"
         self._continuous_url = f"{self._base_url}/continuous"
+        self._pan_cw_value = float(self.get_parameter("camera_pan_cw_value").value)
+        self._pan_ccw_value = float(self.get_parameter("camera_pan_ccw_value").value)
+        self._pan_tolerance_deg = max(
+            0.1, float(self.get_parameter("camera_pan_tolerance_deg").value)
+        )
+        self._pan_wait_max_s = max(
+            0.5, float(self.get_parameter("camera_pan_wait_max_s").value)
+        )
+        self._pan_poll_s = max(0.02, float(self.get_parameter("camera_pan_poll_s").value))
+        self._pan_overshoot_deg = max(
+            0.5, float(self.get_parameter("camera_pan_overshoot_deg").value)
+        )
         self._session = requests.Session()
         self._session.auth = HTTPDigestAuth(self._user, self._password)
         self._ready = False
@@ -205,6 +228,22 @@ class CamaraNode(Node):
             angle = self._az_min
         return angle
 
+    def _cw_distance(self, current_az: float, target_az: float) -> float:
+        dist = float(target_az) - float(current_az)
+        while dist < 0.0:
+            dist += 360.0
+        while dist >= 360.0:
+            dist -= 360.0
+        return dist
+
+    def _ccw_distance(self, current_az: float, target_az: float) -> float:
+        dist = float(current_az) - float(target_az)
+        while dist < 0.0:
+            dist += 360.0
+        while dist >= 360.0:
+            dist -= 360.0
+        return dist
+
     def _request_isapi(
         self, method: str, url: str, data: Optional[str] = None
     ) -> Tuple[Optional[str], str]:
@@ -266,11 +305,84 @@ class CamaraNode(Node):
             return False, err
         return True, ""
 
+    def _set_continuous_pan(self, pan_value: float) -> Tuple[bool, str]:
+        pan = self._clamp(float(pan_value), -100.0, 100.0)
+        payload = (
+            '<PTZData version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">'
+            f"<pan>{pan:.2f}</pan><tilt>0</tilt><zoom>0</zoom>"
+            "</PTZData>"
+        )
+        _, err = self._request_isapi("PUT", self._continuous_url, data=payload)
+        if err:
+            return False, err
+        return True, ""
+
+    def _move_pan_shortest(self, current_az: float, target_az: float) -> Tuple[bool, str]:
+        cw_dist = self._cw_distance(current_az, target_az)
+        ccw_dist = self._ccw_distance(current_az, target_az)
+        if min(cw_dist, ccw_dist) <= self._pan_tolerance_deg:
+            return True, ""
+
+        if cw_dist <= ccw_dist:
+            direction = "cw"
+            pan_cmd = self._pan_cw_value
+            prev_dist = cw_dist
+        else:
+            direction = "ccw"
+            pan_cmd = self._pan_ccw_value
+            prev_dist = ccw_dist
+
+        ok, err = self._set_continuous_pan(pan_cmd)
+        if not ok:
+            return False, f"continuous pan start failed: {err}"
+
+        start_t = time.monotonic()
+        move_error = ""
+        try:
+            while True:
+                time.sleep(self._pan_poll_s)
+                state, state_err = self._get_absolute_state()
+                if state is None:
+                    move_error = f"cannot read PTZ while moving: {state_err}"
+                    break
+
+                current = state[1]
+                current_dist = (
+                    self._cw_distance(current, target_az)
+                    if direction == "cw"
+                    else self._ccw_distance(current, target_az)
+                )
+                if current_dist <= self._pan_tolerance_deg:
+                    break
+
+                # If distance starts increasing, we likely overshot target.
+                if current_dist > (prev_dist + self._pan_overshoot_deg):
+                    break
+
+                if (time.monotonic() - start_t) >= self._pan_wait_max_s:
+                    move_error = (
+                        f"pan move timeout dir={direction} target={target_az:.1f} "
+                        f"dist={current_dist:.2f}"
+                    )
+                    break
+                prev_dist = current_dist
+        finally:
+            stop_ok, stop_err = self._set_continuous_pan(0.0)
+            if (not stop_ok) and (not move_error):
+                move_error = f"continuous pan stop failed: {stop_err}"
+
+        if move_error:
+            return False, move_error
+        return True, ""
+
     def _set_pan_absolute(self, target_azimuth: float) -> Tuple[bool, str]:
         state, err = self._get_absolute_state()
         if state is None:
             return False, f"cannot read current PTZ state: {err}"
-        _, _, current_zoom = state
+        _, current_az, current_zoom = state
+        move_ok, move_err = self._move_pan_shortest(current_az, target_azimuth)
+        if not move_ok:
+            return False, move_err
         # Force neutral tilt in every outgoing pan command.
         return self._set_absolute_state(0.0, target_azimuth, current_zoom)
 
