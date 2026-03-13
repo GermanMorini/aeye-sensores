@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-import os
 import math
+import os
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import rclpy
+import requests
 from ament_index_python.packages import get_package_share_directory
+from requests.auth import HTTPDigestAuth
+from requests.exceptions import RequestException
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 
 from interfaces.srv import CameraPan, CameraStatus
-
-try:
-    from onvif import ONVIFCamera
-except Exception:  # pragma: no cover - dependency/import failure path
-    ONVIFCamera = None
 
 
 def _parse_env_file(path: Path) -> Dict[str, str]:
@@ -60,40 +59,24 @@ def _resolve_default_env_file() -> Path:
         return Path(__file__).resolve().parents[2] / ".env"
 
 
-def _onvif_default_wsdl_dir() -> Path | None:
-    if ONVIFCamera is None:
-        return None
-    try:
-        defaults = getattr(ONVIFCamera.__init__, "__defaults__", None)
-        if defaults and isinstance(defaults[0], str):
-            return Path(defaults[0])
-    except Exception:
-        return None
+def _compact_body(body: str, max_len: int = 280) -> str:
+    compact = " ".join((body or "").strip().split())
+    if not compact:
+        return "<empty>"
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3] + "..."
+
+
+def _local_xml_text(root: ET.Element, local_name: str) -> Optional[str]:
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == local_name and elem.text is not None:
+            return elem.text.strip()
     return None
 
 
-def _resolve_default_wsdl_dir() -> Path:
-    candidates = []
-    try:
-        share_dir = Path(get_package_share_directory("sensores"))
-        candidates.append(share_dir / "wsdl")
-        try:
-            workspace_root = share_dir.parents[3]
-            candidates.append(workspace_root / "src" / "sensores" / "wsdl")
-        except IndexError:
-            pass
-    except Exception:
-        pass
-
-    candidates.append(Path(__file__).resolve().parents[2] / "wsdl")
-    onvif_default = _onvif_default_wsdl_dir()
-    if onvif_default is not None:
-        candidates.append(onvif_default)
-
-    for candidate in candidates:
-        if candidate.is_dir() and (candidate / "devicemgmt.wsdl").exists():
-            return candidate
-    return candidates[0] if candidates else Path("wsdl")
+def _to_float(value: str) -> float:
+    return float(value.replace(",", ".").strip())
 
 
 class CamaraNode(Node):
@@ -109,40 +92,55 @@ class CamaraNode(Node):
         self.declare_parameter("camera_port", int(self._env_cfg("CAMERA_PORT", "80")))
         self.declare_parameter("camera_user", self._env_cfg("CAMERA_USER", "admin"))
         self.declare_parameter("camera_pass", self._env_cfg("CAMERA_PASS", "CHANGE_ME"))
+        self.declare_parameter("camera_channel", int(self._env_cfg("CAMERA_CHANNEL", "1")))
+        self.declare_parameter("camera_timeout_s", 2.0)
 
-        self.declare_parameter("camera_wsdl_dir", str(_resolve_default_wsdl_dir()))
-        self.declare_parameter("camera_profile_token", "")
-        self.declare_parameter("camera_zoom_fixed_level", 0.5)
-        self.declare_parameter("camera_zoom_zero_level", 0.0)
+        # ISAPI PTZ limits (Hikvision defaults used in ptz.sh)
+        self.declare_parameter("camera_az_min", 0.0)
+        self.declare_parameter("camera_az_max", 355.0)
+        self.declare_parameter("camera_el_min", 0.0)
+        self.declare_parameter("camera_el_max", 90.0)
+        self.declare_parameter("camera_zoom_min", 1.0)
+        self.declare_parameter("camera_zoom_max", 4.0)
+        self.declare_parameter("camera_zoom_fixed_level", 4.0)
+        self.declare_parameter("camera_zoom_zero_level", 1.0)
         self.declare_parameter("camera_zoom_initial_in", False)
-        self.declare_parameter("camera_pan_deg_min", 0.0)
-        self.declare_parameter("camera_pan_deg_max", 355.0)
-        self.declare_parameter("camera_onvif_pan_min", -1.0)
-        self.declare_parameter("camera_onvif_pan_max", 1.0)
 
         self._host = str(self.get_parameter("camera_host").value)
         self._port = int(self.get_parameter("camera_port").value)
         self._user = str(self.get_parameter("camera_user").value)
         self._password = str(self.get_parameter("camera_pass").value)
-        self._wsdl_dir = str(self.get_parameter("camera_wsdl_dir").value).strip()
-        self._profile_token_cfg = str(self.get_parameter("camera_profile_token").value)
-        self._zoom_fixed_level = self._clamp_zoom(float(self.get_parameter("camera_zoom_fixed_level").value))
-        self._zoom_zero_level = self._clamp_zoom(float(self.get_parameter("camera_zoom_zero_level").value))
+        self._channel = max(1, int(self.get_parameter("camera_channel").value))
+        self._timeout_s = max(0.2, float(self.get_parameter("camera_timeout_s").value))
+        self._az_min = float(self.get_parameter("camera_az_min").value)
+        self._az_max = float(self.get_parameter("camera_az_max").value)
+        self._el_min = float(self.get_parameter("camera_el_min").value)
+        self._el_max = float(self.get_parameter("camera_el_max").value)
+        self._zoom_min = float(self.get_parameter("camera_zoom_min").value)
+        self._zoom_max = float(self.get_parameter("camera_zoom_max").value)
+        self._zoom_fixed_level = self._clamp(
+            float(self.get_parameter("camera_zoom_fixed_level").value),
+            self._zoom_min,
+            self._zoom_max,
+        )
+        self._zoom_zero_level = self._clamp(
+            float(self.get_parameter("camera_zoom_zero_level").value),
+            self._zoom_min,
+            self._zoom_max,
+        )
         self._zoom_in = bool(self.get_parameter("camera_zoom_initial_in").value)
-        self._pan_deg_min = float(self.get_parameter("camera_pan_deg_min").value)
-        self._pan_deg_max = float(self.get_parameter("camera_pan_deg_max").value)
-        self._onvif_pan_min = float(self.get_parameter("camera_onvif_pan_min").value)
-        self._onvif_pan_max = float(self.get_parameter("camera_onvif_pan_max").value)
-
-        self._camera = None
-        self._media_service = None
-        self._ptz_service = None
-        self._profile_token = ""
+        self._base_url = (
+            f"http://{self._host}:{self._port}/ISAPI/PTZCtrl/channels/{self._channel}"
+        )
+        self._absolute_url = f"{self._base_url}/absoluteEx"
+        self._continuous_url = f"{self._base_url}/continuous"
+        self._session = requests.Session()
+        self._session.auth = HTTPDigestAuth(self._user, self._password)
         self._ready = False
         self._ready_error = ""
         self._last_command = "none"
 
-        self._connect_onvif()
+        self._connect_isapi()
 
         self.create_service(CameraPan, "/camara/camera_pan", self._on_camera_pan)
         self.create_service(
@@ -154,7 +152,9 @@ class CamaraNode(Node):
 
         self.get_logger().info(
             "camara node ready "
-            f"(env_file={self._env_file}, host={self._host}:{self._port}, wsdl_dir={self._wsdl_dir}, onvif_ready={self._ready})"
+            f"(env_file={self._env_file}, host={self._host}:{self._port}, "
+            f"channel={self._channel}, absolute_url={self._absolute_url}, "
+            f"isapi_ready={self._ready})"
         )
 
     def _env_cfg(self, key: str, default: str) -> str:
@@ -166,13 +166,7 @@ class CamaraNode(Node):
             return env_value
         return default
 
-    def _connect_onvif(self) -> None:
-        if ONVIFCamera is None:
-            self._ready = False
-            self._ready_error = "onvif-zeep is not installed"
-            self.get_logger().error(self._ready_error)
-            return
-
+    def _connect_isapi(self) -> None:
         if not self._host or not self._user or not self._password:
             self._ready = False
             self._ready_error = (
@@ -181,147 +175,129 @@ class CamaraNode(Node):
             self.get_logger().error(self._ready_error)
             return
 
-        wsdl_dir = Path(self._wsdl_dir) if self._wsdl_dir else _resolve_default_wsdl_dir()
-        wsdl_probe = wsdl_dir / "devicemgmt.wsdl"
-        if not wsdl_probe.exists():
-            self._ready = False
-            self._ready_error = (
-                f"ONVIF WSDL not found: {wsdl_probe}. "
-                "Set ROS param camera_wsdl_dir to a valid wsdl directory."
-            )
-            self.get_logger().error(self._ready_error)
-            return
-
         try:
             self.get_logger().info(
-                "Attempting ONVIF connection "
-                f"(host={self._host}, port={self._port}, user={self._user}, wsdl_dir={wsdl_dir})"
+                "Attempting ISAPI connection "
+                f"(host={self._host}, port={self._port}, user={self._user}, "
+                f"channel={self._channel}, absolute_url={self._absolute_url})"
             )
-            self._camera = ONVIFCamera(
-                self._host,
-                self._port,
-                self._user,
-                self._password,
-                str(wsdl_dir),
-            )
-            self._media_service = self._camera.create_media_service()
-            self._ptz_service = self._camera.create_ptz_service()
-
-            if self._profile_token_cfg:
-                self._profile_token = self._profile_token_cfg
-            else:
-                profiles = self._media_service.GetProfiles()
-                if not profiles:
-                    raise RuntimeError("camera media service returned no profiles")
-                self._profile_token = str(profiles[0].token)
-
+            state, err = self._get_absolute_state()
+            if state is None:
+                raise RuntimeError(err or "ISAPI absoluteEx probe failed")
+            _, _, zoom = state
+            self._zoom_in = abs(zoom - self._zoom_zero_level) > 0.05
             self._ready = True
             self._ready_error = ""
         except Exception as exc:
             self._ready = False
-            self._ready_error = f"ONVIF init failed: {exc}"
+            self._ready_error = f"ISAPI init failed: {exc}"
             self.get_logger().error(self._ready_error)
-
-    def _clamp_zoom(self, value: float) -> float:
-        return max(0.0, min(1.0, float(value)))
 
     def _clamp(self, value: float, lo: float, hi: float) -> float:
         return max(float(lo), min(float(hi), float(value)))
 
-    def _normalize_angle_deg(self, angle_deg: float) -> float:
+    def _normalize_azimuth(self, angle_deg: float) -> float:
         angle = math.fmod(float(angle_deg), 360.0)
         if angle < 0.0:
             angle += 360.0
+        # Align with ptz.sh behavior: if wrapped past max, snap to min.
+        if angle > self._az_max:
+            angle = self._az_min
         return angle
 
-    def _angle_deg_to_onvif_pan(self, angle_deg: float) -> float:
-        deg_lo = min(self._pan_deg_min, self._pan_deg_max)
-        deg_hi = max(self._pan_deg_min, self._pan_deg_max)
-        clamped_deg = self._clamp(angle_deg, deg_lo, deg_hi)
-
-        deg_span = self._pan_deg_max - self._pan_deg_min
-        if abs(deg_span) < 1e-6:
-            raise RuntimeError("invalid pan mapping: camera_pan_deg_min == camera_pan_deg_max")
-
-        ratio = (clamped_deg - self._pan_deg_min) / deg_span
-        pan = self._onvif_pan_min + ratio * (self._onvif_pan_max - self._onvif_pan_min)
-        pan_lo = min(self._onvif_pan_min, self._onvif_pan_max)
-        pan_hi = max(self._onvif_pan_min, self._onvif_pan_max)
-        return self._clamp(pan, pan_lo, pan_hi)
-
-    def _get_status(self):
-        req = self._ptz_service.create_type("GetStatus")
-        req.ProfileToken = self._profile_token
-        return self._ptz_service.GetStatus(req)
-
-    def _set_pan_absolute(self, angle_deg: float) -> tuple[bool, str]:
+    def _request_isapi(
+        self, method: str, url: str, data: Optional[str] = None
+    ) -> Tuple[Optional[str], str]:
+        headers = {"Content-Type": "application/xml"} if data is not None else None
         try:
-            status = self._get_status()
-            position = getattr(status, "Position", None)
-            pan_tilt = getattr(position, "PanTilt", None) if position is not None else None
-            zoom = getattr(position, "Zoom", None) if position is not None else None
+            res = self._session.request(
+                method=method,
+                url=url,
+                data=data,
+                headers=headers,
+                timeout=self._timeout_s,
+            )
+        except RequestException as exc:
+            return None, f"ISAPI {method} request failed: {exc}"
 
-            target_pan = self._angle_deg_to_onvif_pan(angle_deg)
-            current_tilt = 0.0
-            if pan_tilt is not None and hasattr(pan_tilt, "y"):
-                current_tilt = float(pan_tilt.y)
+        if not res.ok:
+            body = _compact_body(res.text)
+            return (
+                None,
+                f"ISAPI {method} failed: HTTP {res.status_code} {res.reason}; body='{body}'",
+            )
+        return res.text, ""
 
-            req = self._ptz_service.create_type("AbsoluteMove")
-            req.ProfileToken = self._profile_token
-
-            out_pos = {"PanTilt": {"x": float(target_pan), "y": float(current_tilt)}}
-            if zoom is not None and hasattr(zoom, "x"):
-                out_pos["Zoom"] = {"x": self._clamp_zoom(float(zoom.x))}
-            req.Position = out_pos
-
-            self._ptz_service.AbsoluteMove(req)
-            return True, ""
+    def _get_absolute_state(self) -> Tuple[Optional[Tuple[float, float, float]], str]:
+        xml_text, err = self._request_isapi("GET", self._absolute_url)
+        if xml_text is None:
+            return None, err
+        try:
+            root = ET.fromstring(xml_text)
+            el_raw = _local_xml_text(root, "elevation")
+            az_raw = _local_xml_text(root, "azimuth")
+            zm_raw = _local_xml_text(root, "absoluteZoom")
+            if el_raw is None or az_raw is None or zm_raw is None:
+                return (
+                    None,
+                    "ISAPI absoluteEx response missing elevation/azimuth/absoluteZoom",
+                )
+            elevation = _to_float(el_raw)
+            azimuth = _to_float(az_raw)
+            zoom = _to_float(zm_raw)
+            return (elevation, azimuth, zoom), ""
         except Exception as exc:
-            return False, f"AbsoluteMove pan failed: {exc}"
+            body = _compact_body(xml_text)
+            return None, f"invalid ISAPI absoluteEx XML: {exc}; body='{body}'"
 
-    def _set_zoom_absolute(self, target_zoom: float) -> tuple[bool, str]:
-        try:
-            status = self._get_status()
-            position = getattr(status, "Position", None)
-            pan_tilt = None
-            if position is not None:
-                pan_tilt = getattr(position, "PanTilt", None)
+    def _set_absolute_state(self, elevation: float, azimuth: float, zoom: float) -> Tuple[bool, str]:
+        el = int(round(self._clamp(elevation, self._el_min, self._el_max)))
+        az = int(round(self._clamp(azimuth, self._az_min, self._az_max)))
+        zm = int(round(self._clamp(zoom, self._zoom_min, self._zoom_max)))
+        payload = (
+            '<PTZAbsoluteEx version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">'
+            f"<elevation>{el}</elevation>"
+            f"<azimuth>{az}</azimuth>"
+            f"<absoluteZoom>{zm}</absoluteZoom>"
+            "</PTZAbsoluteEx>"
+        )
+        _, err = self._request_isapi("PUT", self._absolute_url, data=payload)
+        if err:
+            return False, err
+        return True, ""
 
-            req = self._ptz_service.create_type("AbsoluteMove")
-            req.ProfileToken = self._profile_token
+    def _set_pan_absolute(self, target_azimuth: float) -> Tuple[bool, str]:
+        state, err = self._get_absolute_state()
+        if state is None:
+            return False, f"cannot read current PTZ state: {err}"
+        current_el, _, current_zoom = state
+        return self._set_absolute_state(current_el, target_azimuth, current_zoom)
 
-            out_pos = {"Zoom": {"x": self._clamp_zoom(target_zoom)}}
-            if pan_tilt is not None:
-                out_pos["PanTilt"] = {"x": float(pan_tilt.x), "y": float(pan_tilt.y)}
-            req.Position = out_pos
+    def _set_zoom_absolute(self, target_zoom: float) -> Tuple[bool, str]:
+        state, err = self._get_absolute_state()
+        if state is None:
+            return False, f"cannot read current PTZ state: {err}"
+        current_el, current_az, _ = state
+        return self._set_absolute_state(current_el, current_az, target_zoom)
 
-            self._ptz_service.AbsoluteMove(req)
-            return True, ""
-        except Exception as exc:
-            return False, f"AbsoluteMove zoom failed: {exc}"
-
-    def _zoom_toggle(self) -> tuple[bool, str]:
-        epsilon = 0.02
-        current_zoom = None
-        try:
-            status = self._get_status()
-            position = getattr(status, "Position", None)
-            zoom = getattr(position, "Zoom", None) if position is not None else None
-            if zoom is not None:
-                current_zoom = float(zoom.x)
-        except Exception:
-            current_zoom = None
-
-        if current_zoom is not None:
+    def _zoom_toggle(self) -> Tuple[bool, str]:
+        epsilon = 0.05
+        state, err = self._get_absolute_state()
+        if state is not None:
+            current_zoom = float(state[2])
             is_zero = abs(current_zoom - self._zoom_zero_level) <= epsilon
             target = self._zoom_fixed_level if is_zero else self._zoom_zero_level
         else:
             target = self._zoom_zero_level if self._zoom_in else self._zoom_fixed_level
+            self.get_logger().warning(
+                f"zoom_toggle: using fallback toggle state because absoluteEx read failed ({err})"
+            )
 
-        ok, err = self._set_zoom_absolute(target)
+        ok, set_err = self._set_zoom_absolute(target)
         if ok:
             self._zoom_in = abs(target - self._zoom_zero_level) > epsilon
-        return ok, err
+            return True, ""
+        return False, set_err
 
     def _on_camera_pan(
         self, request: CameraPan.Request, response: CameraPan.Response
@@ -339,7 +315,7 @@ class CamaraNode(Node):
             response.applied_angle_deg = 0.0
             return response
 
-        applied_angle = self._normalize_angle_deg(input_angle)
+        applied_angle = self._normalize_azimuth(input_angle)
         ok, err = self._set_pan_absolute(applied_angle)
 
         response.ok = bool(ok)
@@ -374,9 +350,17 @@ class CamaraNode(Node):
             response.zoom_in = bool(self._zoom_in)
             return response
 
+        state, err = self._get_absolute_state()
+        if state is None:
+            response.ok = False
+            response.error = err
+            response.last_command = self._last_command
+            response.zoom_in = bool(self._zoom_in)
+            return response
+
+        self._zoom_in = abs(state[2] - self._zoom_zero_level) > 0.05
         response.ok = True
         response.error = ""
-
         response.last_command = self._last_command
         response.zoom_in = bool(self._zoom_in)
         return response

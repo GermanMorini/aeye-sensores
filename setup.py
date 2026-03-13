@@ -33,7 +33,7 @@ setup(
         ]),
         ('share/' + package_name + '/config', ['config/rs16.yaml']),
     ] + _wsdl_data_files(),
-    install_requires=['setuptools', 'websockets', 'onvif-zeep'],
+    install_requires=['setuptools', 'websockets', 'requests'],
     zip_safe=True,
     description='Pixhawk reader node that publishes ROS 2 topics via MAVLink',
     license='MIT',
