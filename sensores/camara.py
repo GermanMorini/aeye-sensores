@@ -306,10 +306,10 @@ class CamaraNode(Node):
         return True, ""
 
     def _set_continuous_pan(self, pan_value: float) -> Tuple[bool, str]:
-        pan = self._clamp(float(pan_value), -100.0, 100.0)
+        pan = int(round(self._clamp(float(pan_value), -100.0, 100.0)))
         payload = (
             '<PTZData version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">'
-            f"<pan>{pan:.2f}</pan><tilt>0</tilt><zoom>0</zoom>"
+            f"<pan>{pan}</pan><tilt>0</tilt><zoom>0</zoom>"
             "</PTZData>"
         )
         _, err = self._request_isapi("PUT", self._continuous_url, data=payload)
@@ -382,7 +382,10 @@ class CamaraNode(Node):
         _, current_az, current_zoom = state
         move_ok, move_err = self._move_pan_shortest(current_az, target_azimuth)
         if not move_ok:
-            return False, move_err
+            self.get_logger().warning(
+                "shortest-pan continuous move failed, "
+                f"falling back to absoluteEx only ({move_err})"
+            )
         # Force neutral tilt in every outgoing pan command.
         return self._set_absolute_state(0.0, target_azimuth, current_zoom)
 
