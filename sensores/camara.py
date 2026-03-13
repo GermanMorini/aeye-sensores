@@ -270,15 +270,17 @@ class CamaraNode(Node):
         state, err = self._get_absolute_state()
         if state is None:
             return False, f"cannot read current PTZ state: {err}"
-        current_el, _, current_zoom = state
-        return self._set_absolute_state(current_el, target_azimuth, current_zoom)
+        _, _, current_zoom = state
+        # Force neutral tilt in every outgoing pan command.
+        return self._set_absolute_state(0.0, target_azimuth, current_zoom)
 
     def _set_zoom_absolute(self, target_zoom: float) -> Tuple[bool, str]:
         state, err = self._get_absolute_state()
         if state is None:
             return False, f"cannot read current PTZ state: {err}"
-        current_el, current_az, _ = state
-        return self._set_absolute_state(current_el, current_az, target_zoom)
+        _, current_az, _ = state
+        # Keep zoom command aligned with neutral tilt convention.
+        return self._set_absolute_state(0.0, current_az, target_zoom)
 
     def _zoom_toggle(self) -> Tuple[bool, str]:
         epsilon = 0.05
