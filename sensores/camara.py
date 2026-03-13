@@ -76,6 +76,20 @@ def _local_xml_text(root: ET.Element, local_name: str) -> Optional[str]:
     return None
 
 
+def _local_xml_child(parent: ET.Element, local_name: str) -> Optional[ET.Element]:
+    for elem in list(parent):
+        if elem.tag.rsplit("}", 1)[-1] == local_name:
+            return elem
+    return None
+
+
+def _local_xml_find(root: ET.Element, local_name: str) -> Optional[ET.Element]:
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == local_name:
+            return elem
+    return None
+
+
 def _to_float(value: str) -> float:
     return float(value.replace(",", ".").strip())
 
@@ -113,7 +127,7 @@ class CamaraNode(Node):
             "camera_pan_ccw_value", float(self._env_cfg("CAMERA_PAN_CCW_VALUE", "80"))
         )
         self.declare_parameter("camera_pan_tolerance_deg", 2.0)
-        self.declare_parameter("camera_pan_wait_max_s", 12.0)
+        self.declare_parameter("camera_pan_wait_max_s", 4.0)
         self.declare_parameter("camera_pan_poll_s", 0.12)
         self.declare_parameter("camera_pan_overshoot_deg", 5.0)
 
@@ -145,23 +159,35 @@ class CamaraNode(Node):
         )
         self._absolute_url = f"{self._base_url}/absoluteEx"
         self._continuous_url = f"{self._base_url}/continuous"
+        self._capabilities_url = f"{self._base_url}/capabilities"
         self._pan_cw_value = float(self.get_parameter("camera_pan_cw_value").value)
         self._pan_ccw_value = float(self.get_parameter("camera_pan_ccw_value").value)
         self._pan_tolerance_deg = max(
             0.1, float(self.get_parameter("camera_pan_tolerance_deg").value)
         )
-        self._pan_wait_max_s = max(
-            0.5, float(self.get_parameter("camera_pan_wait_max_s").value)
-        )
+        pan_wait_requested_s = float(self.get_parameter("camera_pan_wait_max_s").value)
+        self._pan_wait_max_s = max(0.5, min(4.5, pan_wait_requested_s))
         self._pan_poll_s = max(0.02, float(self.get_parameter("camera_pan_poll_s").value))
         self._pan_overshoot_deg = max(
             0.5, float(self.get_parameter("camera_pan_overshoot_deg").value)
         )
+        self._device_az_min = float(self._az_min)
+        self._device_az_max = float(self._az_max)
+        self._device_el_min = float(self._el_min)
+        self._device_el_max = float(self._el_max)
+        self._device_zoom_min = float(self._zoom_min)
+        self._device_zoom_max = float(self._zoom_max)
         self._session = requests.Session()
         self._session.auth = HTTPDigestAuth(self._user, self._password)
         self._ready = False
         self._ready_error = ""
         self._last_command = "none"
+
+        if pan_wait_requested_s > self._pan_wait_max_s:
+            self.get_logger().warning(
+                "camera_pan_wait_max_s capped to "
+                f"{self._pan_wait_max_s:.1f}s to avoid request timeouts"
+            )
 
         self._connect_isapi()
 
@@ -204,6 +230,7 @@ class CamaraNode(Node):
                 f"(host={self._host}, port={self._port}, user={self._user}, "
                 f"channel={self._channel}, absolute_url={self._absolute_url})"
             )
+            self._load_capabilities()
             state, err = self._get_absolute_state()
             if state is None:
                 raise RuntimeError(err or "ISAPI absoluteEx probe failed")
@@ -215,6 +242,150 @@ class CamaraNode(Node):
             self._ready = False
             self._ready_error = f"ISAPI init failed: {exc}"
             self.get_logger().error(self._ready_error)
+
+    def _map_range(
+        self,
+        value: float,
+        src_min: float,
+        src_max: float,
+        dst_min: float,
+        dst_max: float,
+    ) -> float:
+        src_span = float(src_max) - float(src_min)
+        if abs(src_span) <= 1e-9:
+            return float(dst_min)
+        ratio = (float(value) - float(src_min)) / src_span
+        return float(dst_min) + ratio * (float(dst_max) - float(dst_min))
+
+    def _safe_range_from_space(
+        self, root: ET.Element, space_name: str, axis_name: str
+    ) -> Optional[Tuple[float, float]]:
+        space = _local_xml_find(root, space_name)
+        if space is None:
+            return None
+        axis = _local_xml_child(space, axis_name)
+        if axis is None:
+            return None
+        min_elem = _local_xml_child(axis, "Min")
+        max_elem = _local_xml_child(axis, "Max")
+        if min_elem is None or max_elem is None:
+            return None
+        if min_elem.text is None or max_elem.text is None:
+            return None
+        try:
+            return (_to_float(min_elem.text), _to_float(max_elem.text))
+        except Exception:
+            return None
+
+    def _load_capabilities(self) -> None:
+        xml_text, err = self._request_isapi("GET", self._capabilities_url)
+        if xml_text is None:
+            self.get_logger().warning(f"ISAPI capabilities unavailable: {err}")
+            return
+
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Invalid capabilities XML: {exc}; body='{_compact_body(xml_text)}'"
+            )
+            return
+
+        az_range = self._safe_range_from_space(root, "AbsolutePanTiltPositionSpace", "XRange")
+        el_range = self._safe_range_from_space(root, "AbsolutePanTiltPositionSpace", "YRange")
+        zm_range = self._safe_range_from_space(root, "AbsoluteZoomPositionSpace", "ZRange")
+
+        if az_range is not None:
+            self._device_az_min, self._device_az_max = az_range
+        if el_range is not None:
+            self._device_el_min, self._device_el_max = el_range
+        if zm_range is not None:
+            self._device_zoom_min, self._device_zoom_max = zm_range
+
+        self.get_logger().info(
+            "ISAPI capabilities loaded "
+            f"(az_device=[{self._device_az_min:.1f},{self._device_az_max:.1f}], "
+            f"el_device=[{self._device_el_min:.1f},{self._device_el_max:.1f}], "
+            f"zoom_device=[{self._device_zoom_min:.1f},{self._device_zoom_max:.1f}])"
+        )
+
+    def _azimuth_from_device(self, raw_azimuth: float) -> float:
+        return self._clamp(
+            self._map_range(
+                raw_azimuth,
+                self._device_az_min,
+                self._device_az_max,
+                self._az_min,
+                self._az_max,
+            ),
+            self._az_min,
+            self._az_max,
+        )
+
+    def _elevation_from_device(self, raw_elevation: float) -> float:
+        return self._clamp(
+            self._map_range(
+                raw_elevation,
+                self._device_el_min,
+                self._device_el_max,
+                self._el_min,
+                self._el_max,
+            ),
+            self._el_min,
+            self._el_max,
+        )
+
+    def _zoom_from_device(self, raw_zoom: float) -> float:
+        return self._clamp(
+            self._map_range(
+                raw_zoom,
+                self._device_zoom_min,
+                self._device_zoom_max,
+                self._zoom_min,
+                self._zoom_max,
+            ),
+            self._zoom_min,
+            self._zoom_max,
+        )
+
+    def _azimuth_to_device(self, azimuth_deg: float) -> float:
+        return self._clamp(
+            self._map_range(
+                azimuth_deg,
+                self._az_min,
+                self._az_max,
+                self._device_az_min,
+                self._device_az_max,
+            ),
+            self._device_az_min,
+            self._device_az_max,
+        )
+
+    def _elevation_to_device(self, elevation_deg: float) -> float:
+        return self._clamp(
+            self._map_range(
+                elevation_deg,
+                self._el_min,
+                self._el_max,
+                self._device_el_min,
+                self._device_el_max,
+            ),
+            self._device_el_min,
+            self._device_el_max,
+        )
+
+    def _zoom_to_device(self, zoom_level: float) -> float:
+        return self._clamp(
+            self._map_range(
+                zoom_level,
+                self._zoom_min,
+                self._zoom_max,
+                self._device_zoom_min,
+                self._device_zoom_max,
+            ),
+            self._device_zoom_min,
+            self._device_zoom_max,
+        )
 
     def _clamp(self, value: float, lo: float, hi: float) -> float:
         return max(float(lo), min(float(hi), float(value)))
@@ -281,18 +452,18 @@ class CamaraNode(Node):
                     None,
                     "ISAPI absoluteEx response missing elevation/azimuth/absoluteZoom",
                 )
-            elevation = _to_float(el_raw)
-            azimuth = _to_float(az_raw)
-            zoom = _to_float(zm_raw)
+            elevation = self._elevation_from_device(_to_float(el_raw))
+            azimuth = self._azimuth_from_device(_to_float(az_raw))
+            zoom = self._zoom_from_device(_to_float(zm_raw))
             return (elevation, azimuth, zoom), ""
         except Exception as exc:
             body = _compact_body(xml_text)
             return None, f"invalid ISAPI absoluteEx XML: {exc}; body='{body}'"
 
     def _set_absolute_state(self, elevation: float, azimuth: float, zoom: float) -> Tuple[bool, str]:
-        el = int(round(self._clamp(elevation, self._el_min, self._el_max)))
-        az = int(round(self._clamp(azimuth, self._az_min, self._az_max)))
-        zm = int(round(self._clamp(zoom, self._zoom_min, self._zoom_max)))
+        el = int(round(self._elevation_to_device(elevation)))
+        az = int(round(self._azimuth_to_device(azimuth)))
+        zm = int(round(self._zoom_to_device(zoom)))
         payload = (
             '<PTZAbsoluteEx version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">'
             f"<elevation>{el}</elevation>"
