@@ -123,6 +123,23 @@ def quat_conj(q):
     w, x, y, z = q
     return (w, -x, -y, -z)
 
+def quat_from_yaw(yaw_rad: float) -> Tuple[float, float, float, float]:
+    """Build quaternion (w, x, y, z) for a pure yaw rotation around +Z."""
+    half = 0.5 * float(yaw_rad)
+    return (math.cos(half), 0.0, 0.0, math.sin(half))
+
+def yaw_deg_from_quat(q: Tuple[float, float, float, float]) -> float:
+    """Extract ENU yaw from quaternion (w, x, y, z) and return degrees in [-180, 180]."""
+    w, x, y, z = quat_norm(q)
+    siny_cosp = 2.0 * ((w * z) + (x * y))
+    cosy_cosp = 1.0 - (2.0 * ((y * y) + (z * z)))
+    yaw_deg = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+    while yaw_deg <= -180.0:
+        yaw_deg += 360.0
+    while yaw_deg > 180.0:
+        yaw_deg -= 360.0
+    return yaw_deg
+
 def rotvec_by_quat(v: Tuple[float, float, float], q: Tuple[float, float, float, float]) -> Tuple[float, float, float]:
     """Rotate vector v by quaternion q (active rotation)."""
     q = quat_norm(q)
@@ -279,6 +296,7 @@ class PixhawkMavlinkNode(Node):
         self.declare_parameter('rtcm_tcp_host', RTCM_TCP_HOST)
         self.declare_parameter('rtcm_tcp_port', RTCM_TCP_PORT)
         self.declare_parameter('rtcm_topic', '/rtcm')
+        self.declare_parameter('yaw_correction_rad', 0.0)
 
         port = self.get_parameter('serial_port').value
         baud = int(self.get_parameter('baudrate').value)
@@ -292,6 +310,13 @@ class PixhawkMavlinkNode(Node):
         self.rtcm_tcp_host = str(self.get_parameter('rtcm_tcp_host').value)
         self.rtcm_tcp_port = int(self.get_parameter('rtcm_tcp_port').value)
         self.rtcm_topic = str(self.get_parameter('rtcm_topic').value)
+        self.yaw_correction_rad = float(self.get_parameter('yaw_correction_rad').value)
+        self._yaw_correction_quat = quat_from_yaw(self.yaw_correction_rad)
+        self.get_logger().info(
+            'Yaw correction configured '
+            f'(yaw_correction_rad={self.yaw_correction_rad:.6f}, '
+            f'deg={math.degrees(self.yaw_correction_rad):.2f})'
+        )
 
         # ====== Publishers ======
         self.pub_imu = self.create_publisher(Imu, '/imu/data', 20)
@@ -717,6 +742,8 @@ class PixhawkMavlinkNode(Node):
         """Process ATTITUDE_QUATERNION message."""
         q_ned_frd = quat_norm((msg.q1, msg.q2, msg.q3, msg.q4))
         q_enu_flu = quat_ned_frd_to_enu_flu(q_ned_frd)
+        # Apply a global yaw correction in ENU to compensate fixed mounting offsets.
+        q_enu_flu = quat_norm(quat_mul(self._yaw_correction_quat, q_enu_flu))
         self._last_orientation_enu_flu = q_enu_flu
 
         # Body angular rates (FRD → FLU)
@@ -832,10 +859,14 @@ class PixhawkMavlinkNode(Node):
         now = time.time()
         if not hasattr(self, '_last_gps_print') or now - self._last_gps_print >= 1.0:
             self._last_gps_print = now
+            yaw_text = "N/A"
+            if self._last_orientation_enu_flu is not None:
+                yaw_text = f"{yaw_deg_from_quat(self._last_orientation_enu_flu):.1f}"
             self.get_logger().info(
                 f'[GPS] {status_name} | sats={sats} | '
                 f'lat={lat:.7f} lon={lon:.7f} alt={alt:.2f}m | '
-                f'acc={hdop:.2f}m'
+                f'acc={hdop:.2f}m | '
+                f'yaw_enu_deg={yaw_text}'
             )
 
     def _handle_gps_rtk(self, msg):
