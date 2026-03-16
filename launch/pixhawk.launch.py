@@ -13,6 +13,11 @@ def generate_launch_description():
     base_link_frame = LaunchConfiguration('base_link_frame')
     imu_frame = LaunchConfiguration('imu_frame')
     gps_frame = LaunchConfiguration('gps_frame')
+    enable_gps_rtk = LaunchConfiguration('enable_gps_rtk')
+    enable_rtcm_tcp = LaunchConfiguration('enable_rtcm_tcp')
+    rtcm_tcp_host = LaunchConfiguration('rtcm_tcp_host')
+    rtcm_tcp_port = LaunchConfiguration('rtcm_tcp_port')
+    rtcm_topic = LaunchConfiguration('rtcm_topic')
 
     return LaunchDescription(
         [
@@ -51,6 +56,31 @@ def generate_launch_description():
                 default_value='gps_link',
                 description='GPS frame id',
             ),
+            DeclareLaunchArgument(
+                'enable_gps_rtk',
+                default_value='true',
+                description='Request optional GPS_RTK diagnostics from Pixhawk',
+            ),
+            DeclareLaunchArgument(
+                'enable_rtcm_tcp',
+                default_value='true',
+                description='Read RTCM corrections from a TCP source inside pixhawk_driver',
+            ),
+            DeclareLaunchArgument(
+                'rtcm_tcp_host',
+                default_value='127.0.0.1',
+                description='Host for the incoming RTCM TCP stream',
+            ),
+            DeclareLaunchArgument(
+                'rtcm_tcp_port',
+                default_value='2102',
+                description='Port for the incoming RTCM TCP stream',
+            ),
+            DeclareLaunchArgument(
+                'rtcm_topic',
+                default_value='/rtcm',
+                description='Optional ROS topic carrying RTCM bytes',
+            ),
             Node(
                 package='sensores',
                 executable='pixhawk_driver',
@@ -63,6 +93,11 @@ def generate_launch_description():
                     {'base_link_frame': base_link_frame},
                     {'imu_frame': imu_frame},
                     {'gps_frame': gps_frame},
+                    {'enable_gps_rtk': enable_gps_rtk},
+                    {'enable_rtcm_tcp': enable_rtcm_tcp},
+                    {'rtcm_tcp_host': rtcm_tcp_host},
+                    {'rtcm_tcp_port': rtcm_tcp_port},
+                    {'rtcm_topic': rtcm_topic},
                 ],
             ),
             Node(
