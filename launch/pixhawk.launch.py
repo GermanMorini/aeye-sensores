@@ -13,7 +13,7 @@ def generate_launch_description():
     base_link_frame = LaunchConfiguration('base_link_frame')
     imu_frame = LaunchConfiguration('imu_frame')
     gps_frame = LaunchConfiguration('gps_frame')
-    yaw_correction_rad = LaunchConfiguration('yaw_correction_rad')
+    yaw_correction_deg = LaunchConfiguration('yaw_correction_deg')
     enable_gps_rtk = LaunchConfiguration('enable_gps_rtk')
     enable_rtcm_tcp = LaunchConfiguration('enable_rtcm_tcp')
     rtcm_tcp_host = LaunchConfiguration('rtcm_tcp_host')
@@ -58,9 +58,9 @@ def generate_launch_description():
                 description='GPS frame id',
             ),
             DeclareLaunchArgument(
-                'yaw_correction_rad',
+                'yaw_correction_deg',
                 default_value='0.0',
-                description='Global yaw correction applied by pixhawk_driver (radians)',
+                description='Global yaw correction applied by pixhawk_driver (degrees)',
             ),
             DeclareLaunchArgument(
                 'enable_gps_rtk',
@@ -99,7 +99,7 @@ def generate_launch_description():
                     {'base_link_frame': base_link_frame},
                     {'imu_frame': imu_frame},
                     {'gps_frame': gps_frame},
-                    {'yaw_correction_rad': yaw_correction_rad},
+                    {'yaw_correction_deg': yaw_correction_deg},
                     {'enable_gps_rtk': enable_gps_rtk},
                     {'enable_rtcm_tcp': enable_rtcm_tcp},
                     {'rtcm_tcp_host': rtcm_tcp_host},

@@ -296,7 +296,7 @@ class PixhawkMavlinkNode(Node):
         self.declare_parameter('rtcm_tcp_host', RTCM_TCP_HOST)
         self.declare_parameter('rtcm_tcp_port', RTCM_TCP_PORT)
         self.declare_parameter('rtcm_topic', '/rtcm')
-        self.declare_parameter('yaw_correction_rad', 0.0)
+        self.declare_parameter('yaw_correction_deg', 0.0)
 
         port = self.get_parameter('serial_port').value
         baud = int(self.get_parameter('baudrate').value)
@@ -310,12 +310,13 @@ class PixhawkMavlinkNode(Node):
         self.rtcm_tcp_host = str(self.get_parameter('rtcm_tcp_host').value)
         self.rtcm_tcp_port = int(self.get_parameter('rtcm_tcp_port').value)
         self.rtcm_topic = str(self.get_parameter('rtcm_topic').value)
-        self.yaw_correction_rad = float(self.get_parameter('yaw_correction_rad').value)
+        self.yaw_correction_deg = float(self.get_parameter('yaw_correction_deg').value)
+        self.yaw_correction_rad = math.radians(self.yaw_correction_deg)
         self._yaw_correction_quat = quat_from_yaw(self.yaw_correction_rad)
         self.get_logger().info(
             'Yaw correction configured '
-            f'(yaw_correction_rad={self.yaw_correction_rad:.6f}, '
-            f'deg={math.degrees(self.yaw_correction_rad):.2f})'
+            f'(yaw_correction_deg={self.yaw_correction_deg:.2f}, '
+            f'rad={self.yaw_correction_rad:.6f})'
         )
 
         # ====== Publishers ======
