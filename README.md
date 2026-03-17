@@ -43,6 +43,31 @@ ros2 run sensores sensores_web
 ```
 Abrir en el navegador: `http://localhost:8000`.
 
+Dashboard con MAVROS (recomendado):
+```bash
+ros2 launch sensores mavros.launch.py launch_web:=true
+```
+Por defecto usa perfil MAVROS **sensor-only** (allowlist mínima) para no exponer rutas de control/autopilot desde ROS.
+
+Al lanzarse así, `sensores_web` consume por defecto:
+- IMU: `/mavros/imu/data`
+- GPS: `/mavros/global_position/raw/fix`
+- Velocity: `/mavros/local_position/velocity_local`
+- Odom: `/mavros/local_position/odom`
+
+`mavros.launch.py` agrega una capa de compatibilidad de tópicos para MAVROS Humble:
+- `/mavros/mavros_node/data` -> `/mavros/imu/data`
+- `/mavros/mavros_node/raw/fix` -> `/mavros/global_position/raw/fix`
+- `/mavros/mavros_node/velocity_local` -> `/mavros/local_position/velocity_local`
+- `/mavros/mavros_node/odom` -> `/mavros/local_position/odom`
+
+El payload `/data` y WS incluye diagnóstico de orientación:
+- `imu.yaw_enu_rad`, `imu.yaw_enu_deg`
+- `odom.yaw_enu_rad`, `odom.yaw_enu_deg`
+- `diagnostics.yaw_delta_deg` (IMU - Odom)
+- `topics.{imu,gps,velocity,odom}` con los bindings activos
+Convención ENU: `0°=Este`, `90°=Norte`, rango `[-180, 180]`.
+
 Lanzar ambos nodos (incluye servidor web):
 ```bash
 ros2 launch sensores pixhawk.launch.py launch_web:=true

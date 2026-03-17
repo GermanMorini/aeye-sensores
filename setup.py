@@ -28,10 +28,15 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name, ['pixhawk_dashboard.html']),
         ('share/' + package_name + '/launch', [
+            'launch/mavros.launch.py',
             'launch/pixhawk.launch.py',
             'launch/rs16.launch.py',
         ]),
-        ('share/' + package_name + '/config', ['config/rs16.yaml']),
+        ('share/' + package_name + '/config', [
+            'config/mavros_apm_overrides.yaml',
+            'config/mavros_sensor_only_pluginlists.yaml',
+            'config/rs16.yaml',
+        ]),
     ] + _wsdl_data_files(),
     install_requires=['setuptools', 'websockets', 'requests'],
     zip_safe=True,
