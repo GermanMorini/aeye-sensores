@@ -1,127 +1,111 @@
 # sensores
 
-Paquete ROS 2 que se conecta a un Pixhawk (ej. Pixhawk 6X con ArduPilot)
-por MAVLink y publica datos de IMU, GPS, velocidad y odometria en topicos
-estandar de ROS 2.
+Paquete ROS 2 para integración con Pixhawk y utilidades auxiliares de telemetría y cámara.
 
-## Funcionalidad
-- Lee MAVLink por puerto serie y solicita streams de datos.
-- Publica IMU en `/imu/data` y GPS en `/gps/fix`.
-- Publica velocidad en `/velocity` y odometria en `/odom`.
-- Convierte marcos: NED -> ENU y FRD -> FLU para compatibilidad ROS.
-- Incluye servidor web con WebSocket para visualizar telemetria.
+## Ejecutables reales
+- `pixhawk_driver`
+- `sensores_web`
+- `camara`
 
-## Dependencias
-- ROS 2 con `rclpy`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `std_msgs`.
-- `pymavlink` (paquete `python3-pymavlink`).
+## Launches reales
+- `ros2 launch sensores pixhawk.launch.py`
+- `ros2 launch sensores rs16.launch.py`
 
-## Compilar
+## `pixhawk_driver`
+Publica:
+- `/imu/data`
+- `/gps/fix`
+- `/odom`
+- `/velocity`
+- `/gps/rtk_status`
+- `/gps/fix_type`
+- `/gps/satellites_visible`
+- `/gps/hdop`
+- `/gps/rtcm_age_s`
+- `/gps/rtcm_received_count`
+- `/gps/rtcm_sequence_id`
+
+Parámetros principales:
+- `serial_port` (default `/dev/ttyACM0`)
+- `baudrate` (default `921600`)
+- `odom_frame` (default `odom`)
+- `base_link_frame` (default `base_footprint`)
+- `imu_frame` (default `imu_link`)
+- `gps_frame` (default `gps_link`)
+- `publish_rate_hz` (default `200.0`)
+- `enable_gps_rtk`
+- `enable_rtcm_tcp`
+- `rtcm_tcp_host`
+- `rtcm_tcp_port`
+- `rtcm_topic`
+- `yaw_correction_deg`
+
+Ejecución directa:
 ```bash
-colcon build --packages-select sensores
-source install/setup.bash
+ros2 run sensores pixhawk_driver --ros-args -p serial_port:=/dev/ttyACM0 -p baudrate:=921600
 ```
 
-## LiDAR RS-LiDAR-16 (driver)
-Clonar los repositorios del driver y mensajes del LiDAR **dentro de** `src` (**importante**)
+## `sensores_web`
+Sirve `pixhawk_dashboard.html` y expone datos por HTTP y WebSocket.
 
-Recuerda estar en el workspace de ROS:
-```bash
-git clone 'https://github.com/RoboSense-LiDAR/rslidar_msg' src/rslidar_msg
-git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git src/rslidar_sdk
-cd src/rslidar_sdk
-git submodule update --init --recursive
-```
+Parámetros:
+- `imu_topic`
+- `gps_topic`
+- `velocity_topic`
+- `odom_topic`
+- `http_host`
+- `http_port`
+- `ws_host`
+- `ws_port`
+- `html_path`
 
-## Ejecutar
-```bash
-ros2 run sensores sensores
-```
-
-Servidor web (sirve `pixhawk_dashboard.html`, JSON en `/data` y WebSocket):
+Ejecutar:
 ```bash
 ros2 run sensores sensores_web
 ```
-Abrir en el navegador: `http://localhost:8000`.
 
-Lanzar ambos nodos (incluye servidor web):
+## `camara`
+Nodo opcional para control ISAPI de cámara.
+
+Servicios:
+- `/camara/camera_pan`
+- `/camara/camera_zoom_toggle`
+- `/camara/camera_status`
+
+Ejecutar:
 ```bash
-ros2 launch sensores pixhawk.launch.py launch_web:=true
+ros2 run sensores camara
 ```
 
-Solo el driver:
+## Launch de Pixhawk
+Solo driver:
 ```bash
 ros2 launch sensores pixhawk.launch.py
 ```
 
-Lanzar LiDAR RS-LiDAR-16 (rslidar_sdk):
+Driver + dashboard web:
+```bash
+ros2 launch sensores pixhawk.launch.py launch_web:=true
+```
+
+## Launch de RS16
+Este launch envuelve `rslidar_sdk`, que se considera una dependencia vendorizada del workspace.
+
+Driver:
 ```bash
 ros2 launch sensores rs16.launch.py
 ```
 
-Lanzar LiDAR + RViz:
+Driver + RViz:
 ```bash
 ros2 launch sensores rs16.launch.py rviz:=true
 ```
 
-Usar un config personalizado:
+Config personalizado:
 ```bash
-ros2 launch sensores rs16.launch.py config_path:=/ruta/a/config.yaml
+ros2 launch sensores rs16.launch.py config_path:=/ruta/a/rs16.yaml
 ```
 
-Con parametros personalizados:
-```bash
-ros2 run sensores sensores --ros-args \
-  -p serial_port:=/dev/ttyACM0 \
-  -p baudrate:=921600 \
-  -p imu_frame:=imu_link \
-  -p gps_frame:=gps \
-  -p odom_frame:=odom \
-  -p base_link_frame:=base_link
-```
-
-## Topicos publicados
-- `/imu/data` (`sensor_msgs/Imu`)
-  - Aceleracion lineal y gyro desde `SCALED_IMU2` (o `SCALED_IMU` si no hay IMU2).
-  - Orientacion desde `ATTITUDE_QUATERNION` (EKF).
-  - Unidades: aceleracion en `m/s^2`, gyro en `rad/s`.
-- `/gps/fix` (`sensor_msgs/NavSatFix`)
-  - Posicion GPS desde `GPS_RAW_INT`.
-- `/velocity` (`geometry_msgs/TwistStamped`)
-  - Velocidad lineal en marco del cuerpo (FLU) y angular si esta disponible.
-  - Se publica a partir de `/odom` (mismo timestamp).
-- `/odom` (`nav_msgs/Odometry`)
-  - Pose en `odom_frame` (ENU) con `child_frame_id` en `base_link_frame`.
-  - Usa `LOCAL_POSITION_NED` + actitud (EKF) convertido a ENU/FLU.
-
-## Parametros
-- `serial_port` (string, default `/dev/ttyACM0`)
-- `baudrate` (int, default `921600`)
-- `odom_frame` (string, default `odom`)
-- `base_link_frame` (string, default `base_link`)
-- `imu_frame` (string, default `imu_link`)
-- `gps_frame` (string, default `gps`)
-- `publish_rate_hz` (float, default `200.0`)
-
-## Parametros del servidor web
-- `imu_topic` (string, default `/imu/data`)
-- `gps_topic` (string, default `/gps/fix`)
-- `velocity_topic` (string, default `/velocity`)
-- `odom_topic` (string, default `/odom`)
-- `http_host` (string, default `0.0.0.0`)
-- `http_port` (int, default `8000`)
-- `ws_host` (string, default `0.0.0.0`)
-- `ws_port` (int, default `8001`)
-- `html_path` (string, default vacio; usa `pixhawk_dashboard.html` del paquete)
-
-## Streams MAVLink solicitados
-- `ATTITUDE_QUATERNION` a 50 Hz.
-- `SCALED_IMU2` a 100 Hz (fallback `SCALED_IMU`).
-- `LOCAL_POSITION_NED` a 50 Hz.
-- `GPS_RAW_INT` a 10 Hz.
-
-## Notas y solucion de problemas
-- Verifica permisos del puerto serie (grupo `dialout` en Linux).
-- El nodo espera un heartbeat de MAVLink; si no aparece en 10 s, revisa el
-  puerto y el baudrate.
-- `/odom` y `/velocity` dependen de `LOCAL_POSITION_NED` (EKF). En ArduPilot
-  puede requerir habilitar `SR0_POSITION` (USB) para que se publique.
+## Notas
+- El nombre correcto del ejecutable Pixhawk es `pixhawk_driver`; `ros2 run sensores sensores` ya no aplica en este checkout.
+- Los defaults de `pixhawk.launch.py` usan `base_footprint` y `gps_link`; mantén README y launch alineados si cambias esos frames.
