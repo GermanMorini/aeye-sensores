@@ -5,12 +5,14 @@ ROS 2 node that serves a local HTML dashboard and exposes Pixhawk data as JSON.
 
 import asyncio
 import json
+import math
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import Imu, NavSatFix
 from geometry_msgs.msg import TwistStamped
@@ -22,6 +24,26 @@ def _stamp_to_float(stamp):
     if stamp is None:
         return None
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def _normalize_angle_rad(angle_rad: float) -> float:
+    return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+def _yaw_enu_from_quaternion(
+    qx: float, qy: float, qz: float, qw: float
+) -> tuple[float | None, float | None]:
+    values = (qx, qy, qz, qw)
+    if not all(math.isfinite(v) for v in values):
+        return None, None
+
+    yaw = math.atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy * qy + qz * qz),
+    )
+    yaw = _normalize_angle_rad(yaw)
+    yaw_deg = math.degrees(yaw)
+    return yaw, yaw_deg
 
 
 class PixhawkWebServer(Node):
@@ -47,6 +69,12 @@ class PixhawkWebServer(Node):
         ws_host = self.get_parameter('ws_host').value
         ws_port = self.get_parameter('ws_port').value
         html_path = self.get_parameter('html_path').value
+        self._topic_bindings = {
+            'imu': str(imu_topic),
+            'gps': str(gps_topic),
+            'velocity': str(velocity_topic),
+            'odom': str(odom_topic),
+        }
 
         if not html_path:
             share_dir = Path(get_package_share_directory('sensores'))
@@ -59,16 +87,26 @@ class PixhawkWebServer(Node):
             'gps': None,
             'velocity': None,
             'odom': None,
+            'topics': dict(self._topic_bindings),
+            'diagnostics': {'yaw_delta_deg': None},
         }
         self._ws_clients = set()
         self._ws_loop = None
         self._ws_server = None
         self._ws_stop_event = None
 
-        self.create_subscription(Imu, imu_topic, self._imu_cb, 20)
-        self.create_subscription(NavSatFix, gps_topic, self._gps_cb, 20)
-        self.create_subscription(TwistStamped, velocity_topic, self._velocity_cb, 20)
-        self.create_subscription(Odometry, odom_topic, self._odom_cb, 20)
+        self.create_subscription(
+            Imu, imu_topic, self._imu_cb, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            NavSatFix, gps_topic, self._gps_cb, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            TwistStamped, velocity_topic, self._velocity_cb, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            Odometry, odom_topic, self._odom_cb, qos_profile_sensor_data
+        )
 
         self._httpd = self._start_http_server(http_host, int(http_port))
         self.get_logger().info(
@@ -78,6 +116,13 @@ class PixhawkWebServer(Node):
         self._start_ws_server(ws_host, int(ws_port))
         self.get_logger().info(
             f'WebSocket server running at ws://{ws_host}:{ws_port}/ws'
+        )
+        self.get_logger().info(
+            'Dashboard topic bindings: '
+            f"imu={self._topic_bindings['imu']}, "
+            f"gps={self._topic_bindings['gps']}, "
+            f"velocity={self._topic_bindings['velocity']}, "
+            f"odom={self._topic_bindings['odom']}"
         )
 
     def _load_html(self, html_path: str) -> str:
@@ -164,6 +209,12 @@ class PixhawkWebServer(Node):
             await asyncio.sleep(0.25)
 
     def _imu_cb(self, msg: Imu):
+        yaw_enu_rad, yaw_enu_deg = _yaw_enu_from_quaternion(
+            msg.orientation.x,
+            msg.orientation.y,
+            msg.orientation.z,
+            msg.orientation.w,
+        )
         data = {
             'stamp': _stamp_to_float(msg.header.stamp),
             'frame_id': msg.header.frame_id,
@@ -173,6 +224,8 @@ class PixhawkWebServer(Node):
                 'z': msg.orientation.z,
                 'w': msg.orientation.w,
             },
+            'yaw_enu_rad': yaw_enu_rad,
+            'yaw_enu_deg': yaw_enu_deg,
             'angular_velocity': {
                 'x': msg.angular_velocity.x,
                 'y': msg.angular_velocity.y,
@@ -186,6 +239,7 @@ class PixhawkWebServer(Node):
         }
         with self._data_lock:
             self._data['imu'] = data
+            self._update_diagnostics_locked()
 
     def _gps_cb(self, msg: NavSatFix):
         data = {
@@ -219,6 +273,12 @@ class PixhawkWebServer(Node):
             self._data['velocity'] = data
 
     def _odom_cb(self, msg: Odometry):
+        yaw_enu_rad, yaw_enu_deg = _yaw_enu_from_quaternion(
+            msg.pose.pose.orientation.x,
+            msg.pose.pose.orientation.y,
+            msg.pose.pose.orientation.z,
+            msg.pose.pose.orientation.w,
+        )
         data = {
             'stamp': _stamp_to_float(msg.header.stamp),
             'frame_id': msg.header.frame_id,
@@ -234,6 +294,8 @@ class PixhawkWebServer(Node):
                 'z': msg.pose.pose.orientation.z,
                 'w': msg.pose.pose.orientation.w,
             },
+            'yaw_enu_rad': yaw_enu_rad,
+            'yaw_enu_deg': yaw_enu_deg,
             'linear': {
                 'x': msg.twist.twist.linear.x,
                 'y': msg.twist.twist.linear.y,
@@ -247,6 +309,22 @@ class PixhawkWebServer(Node):
         }
         with self._data_lock:
             self._data['odom'] = data
+            self._update_diagnostics_locked()
+
+    def _update_diagnostics_locked(self):
+        imu = self._data.get('imu') or {}
+        odom = self._data.get('odom') or {}
+
+        imu_yaw_rad = imu.get('yaw_enu_rad')
+        odom_yaw_rad = odom.get('yaw_enu_rad')
+        yaw_delta_deg = None
+
+        if isinstance(imu_yaw_rad, (int, float)) and isinstance(odom_yaw_rad, (int, float)):
+            if math.isfinite(float(imu_yaw_rad)) and math.isfinite(float(odom_yaw_rad)):
+                delta_rad = _normalize_angle_rad(float(imu_yaw_rad) - float(odom_yaw_rad))
+                yaw_delta_deg = math.degrees(delta_rad)
+
+        self._data['diagnostics']['yaw_delta_deg'] = yaw_delta_deg
 
     def destroy_node(self):
         if hasattr(self, '_httpd') and self._httpd is not None:
