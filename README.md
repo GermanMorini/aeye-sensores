@@ -4,6 +4,7 @@ Paquete ROS 2 para integración con Pixhawk, dashboard web y utilidades auxiliar
 
 ## Ejecutables reales
 - `pixhawk_driver`
+- `mavros_compat_bridge`
 - `sensores_web`
 - `camara`
 
@@ -96,7 +97,7 @@ ros2 launch sensores pixhawk.launch.py launch_web:=true
 ```
 
 ## Launch de MAVROS
-Este launch usa `mavros` + `mavros_extras` y deja `sensores_web` suscrito a la salida de MAVROS en lugar del driver propio.
+Este launch usa `mavros` + `mavros_extras`. El contrato nativo de MAVROS queda en tópicos root-level y, por defecto, un bridge temporal repone el contrato legacy que consumen navegación y web.
 
 Dashboard con MAVROS:
 ```bash
@@ -108,25 +109,34 @@ Parámetros principales:
 - `gcs_url`
 - `tgt_system`
 - `tgt_component`
-- `namespace` (default `mavros`)
+- `namespace` (default vacío; deja los tópicos nativos en root-level)
 - `fcu_protocol` (default `v2.0`)
 - `pluginlists_yaml`
 - `config_yaml`
 - `apm_config_yaml`
+- `launch_legacy_compat` (default `true`)
+
+Contrato MAVROS nativo:
+- `/imu/data`
+- `/global_position/raw/fix`
+- `/local_position/velocity_local`
+- `/local_position/odom`
+- `/state`
+
+Contrato legacy temporal publicado por `mavros_compat_bridge`:
+- `/gps/fix`
+- `/odom`
+- `/velocity`
 
 Bindings por defecto del dashboard:
-- IMU: `/mavros/imu/data`
-- GPS: `/mavros/global_position/raw/fix`
-- Velocidad: `/mavros/local_position/velocity_local`
-- Odometría: `/mavros/local_position/odom`
-
-`mavros.launch.py` agrega remaps de compatibilidad para MAVROS Humble:
-- `mavros_node/data` -> `imu/data`
-- `mavros_node/raw/fix` -> `global_position/raw/fix`
-- `mavros_node/velocity_local` -> `local_position/velocity_local`
-- `mavros_node/odom` -> `local_position/odom`
+- IMU: `/imu/data`
+- GPS: `/global_position/raw/fix`
+- Velocidad: `/local_position/velocity_local`
+- Odometría: `/local_position/odom`
 
 El perfil por defecto es `sensor-only` para no exponer interfaces de control desde ROS.
+
+`mavros_compat_bridge` no transforma frames, yaw ni coordenadas. Solo republica mensajes nativos de MAVROS al contrato legacy y emite warnings claros cuando faltan publishers o datos frescos en los tópicos esperados.
 
 ## Launch de RS16
 Este launch envuelve `rslidar_sdk`, que se considera una dependencia vendorizada del workspace.
@@ -149,4 +159,5 @@ ros2 launch sensores rs16.launch.py config_path:=/ruta/a/rs16.yaml
 ## Notas
 - El nombre correcto del ejecutable Pixhawk es `pixhawk_driver`; `ros2 run sensores sensores` no aplica en este checkout.
 - Los defaults de `pixhawk.launch.py` usan `base_footprint` y `gps_link`; si los cambias, mantén README y launch alineados.
+- El camino MAVROS no reutiliza `yaw_correction_deg`; cualquier ajuste de heading debe resolverse en localización/configuración y no reinyectando correcciones del driver viejo.
 - `mavros.launch.py` requiere que `mavros` y `mavros_extras` estén instalados en el entorno ROS 2.

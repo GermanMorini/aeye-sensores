@@ -40,12 +40,13 @@ setup(
     ] + _wsdl_data_files(),
     install_requires=['setuptools', 'websockets', 'requests'],
     zip_safe=True,
-    description='Pixhawk reader node that publishes ROS 2 topics via MAVLink',
+    description='ROS 2 sensor integration for Pixhawk telemetry, MAVROS and web tools',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'pixhawk_driver = sensores.pixhawk_driver:main',
+            'mavros_compat_bridge = sensores.mavros_compat_bridge:main',
             'sensores_web = sensores.web_server:main',
             'camara = sensores.camara:main',
         ],

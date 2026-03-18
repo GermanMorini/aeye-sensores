@@ -13,6 +13,7 @@ def generate_launch_description():
     mavros_share_dir = get_package_share_directory("mavros")
 
     launch_web = LaunchConfiguration("launch_web")
+    launch_legacy_compat = LaunchConfiguration("launch_legacy_compat")
     fcu_url = LaunchConfiguration("fcu_url")
     gcs_url = LaunchConfiguration("gcs_url")
     tgt_system = LaunchConfiguration("tgt_system")
@@ -39,6 +40,11 @@ def generate_launch_description():
                 description="Launch the sensores_web node",
             ),
             DeclareLaunchArgument(
+                "launch_legacy_compat",
+                default_value="true",
+                description="Republish MAVROS native topics to the legacy contract",
+            ),
+            DeclareLaunchArgument(
                 "fcu_url",
                 default_value="/dev/ttyACM0:921600",
                 description="FCU connection URL used by MAVROS",
@@ -60,8 +66,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "namespace",
-                default_value="mavros",
-                description="Namespace for mavros_node",
+                default_value="",
+                description="Optional namespace for mavros_node; empty keeps canonical root-level topics",
             ),
             DeclareLaunchArgument(
                 "fcu_protocol",
@@ -89,13 +95,11 @@ def generate_launch_description():
                 name="mavros_node",
                 namespace=namespace,
                 output="screen",
-                # Compat layer: keep legacy project topic contract while MAVROS
-                # publishes under mavros_node/* in recent ROS 2 Humble builds.
                 remappings=[
-                    ("mavros_node/data", "imu/data"),
-                    ("mavros_node/raw/fix", "global_position/raw/fix"),
-                    ("mavros_node/velocity_local", "local_position/velocity_local"),
-                    ("mavros_node/odom", "local_position/odom"),
+                    ("mavros_node/data", "/imu/data"),
+                    ("mavros_node/raw/fix", "/global_position/raw/fix"),
+                    ("mavros_node/velocity_local", "/local_position/velocity_local"),
+                    ("mavros_node/odom", "/local_position/odom"),
                 ],
                 parameters=[
                     pluginlists_yaml,
@@ -112,15 +116,22 @@ def generate_launch_description():
             ),
             Node(
                 package="sensores",
+                executable="mavros_compat_bridge",
+                name="mavros_compat_bridge",
+                output="screen",
+                condition=IfCondition(launch_legacy_compat),
+            ),
+            Node(
+                package="sensores",
                 executable="sensores_web",
                 name="sensores_web",
                 output="screen",
                 condition=IfCondition(launch_web),
                 parameters=[
-                    {"imu_topic": "/mavros/imu/data"},
-                    {"gps_topic": "/mavros/global_position/raw/fix"},
-                    {"velocity_topic": "/mavros/local_position/velocity_local"},
-                    {"odom_topic": "/mavros/local_position/odom"},
+                    {"imu_topic": "/imu/data"},
+                    {"gps_topic": "/global_position/raw/fix"},
+                    {"velocity_topic": "/local_position/velocity_local"},
+                    {"odom_topic": "/local_position/odom"},
                 ],
             ),
         ]
