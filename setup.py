@@ -47,6 +47,7 @@ setup(
         'console_scripts': [
             'pixhawk_driver = sensores.pixhawk_driver:main',
             'mavros_compat_bridge = sensores.mavros_compat_bridge:main',
+            'rtk_bridge = sensores.rtk_bridge:main',
             'sensores_web = sensores.web_server:main',
             'camara = sensores.camara:main',
         ],

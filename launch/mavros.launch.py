@@ -14,6 +14,13 @@ def generate_launch_description():
 
     launch_web = LaunchConfiguration("launch_web")
     launch_legacy_compat = LaunchConfiguration("launch_legacy_compat")
+    enable_rtk = LaunchConfiguration("enable_rtk")
+    enable_rtcm_tcp = LaunchConfiguration("enable_rtcm_tcp")
+    rtcm_tcp_host = LaunchConfiguration("rtcm_tcp_host")
+    rtcm_tcp_port = LaunchConfiguration("rtcm_tcp_port")
+    rtcm_topic = LaunchConfiguration("rtcm_topic")
+    send_rtcm_topic = LaunchConfiguration("send_rtcm_topic")
+    gps_topic = LaunchConfiguration("gps_topic")
     fcu_url = LaunchConfiguration("fcu_url")
     gcs_url = LaunchConfiguration("gcs_url")
     tgt_system = LaunchConfiguration("tgt_system")
@@ -43,6 +50,41 @@ def generate_launch_description():
                 "launch_legacy_compat",
                 default_value="true",
                 description="Republish MAVROS native topics to the legacy contract",
+            ),
+            DeclareLaunchArgument(
+                "enable_rtk",
+                default_value="false",
+                description="Launch the RTK bridge that feeds RTCM to the MAVROS gps_rtk plugin",
+            ),
+            DeclareLaunchArgument(
+                "enable_rtcm_tcp",
+                default_value="true",
+                description="Read RTCM corrections from a TCP source",
+            ),
+            DeclareLaunchArgument(
+                "rtcm_tcp_host",
+                default_value="127.0.0.1",
+                description="Host for the incoming RTCM TCP stream",
+            ),
+            DeclareLaunchArgument(
+                "rtcm_tcp_port",
+                default_value="2102",
+                description="Port for the incoming RTCM TCP stream",
+            ),
+            DeclareLaunchArgument(
+                "rtcm_topic",
+                default_value="/rtcm",
+                description="Optional ROS topic carrying RTCM corrections",
+            ),
+            DeclareLaunchArgument(
+                "send_rtcm_topic",
+                default_value="/mavros_node/send_rtcm",
+                description="Topic consumed by the MAVROS gps_rtk plugin; override if mavros_node runs in a namespace",
+            ),
+            DeclareLaunchArgument(
+                "gps_topic",
+                default_value="/global_position/raw/fix",
+                description="Native GPS topic used for RTK diagnostics and the web dashboard",
             ),
             DeclareLaunchArgument(
                 "fcu_url",
@@ -129,9 +171,24 @@ def generate_launch_description():
                 condition=IfCondition(launch_web),
                 parameters=[
                     {"imu_topic": "/imu/data"},
-                    {"gps_topic": "/global_position/raw/fix"},
+                    {"gps_topic": gps_topic},
                     {"velocity_topic": "/local_position/velocity_local"},
                     {"odom_topic": "/local_position/odom"},
+                ],
+            ),
+            Node(
+                package="sensores",
+                executable="rtk_bridge",
+                name="rtk_bridge",
+                output="screen",
+                condition=IfCondition(enable_rtk),
+                parameters=[
+                    {"enable_rtcm_tcp": enable_rtcm_tcp},
+                    {"rtcm_tcp_host": rtcm_tcp_host},
+                    {"rtcm_tcp_port": rtcm_tcp_port},
+                    {"rtcm_topic": rtcm_topic},
+                    {"send_rtcm_topic": send_rtcm_topic},
+                    {"gps_topic": gps_topic},
                 ],
             ),
         ]
