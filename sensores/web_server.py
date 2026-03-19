@@ -69,7 +69,7 @@ class PixhawkWebServer(Node):
         self.declare_parameter('rtk_status_topic', '/gps/rtk_status')
         self.declare_parameter('rtcm_age_topic', '/gps/rtcm_age_s')
         self.declare_parameter('rtcm_count_topic', '/gps/rtcm_received_count')
-        self.declare_parameter('gps_raw_topic', '/mavros_node/gpsstatus/gps1/raw')
+        self.declare_parameter('gps_raw_topic', '/mavros_node/gps1/raw')
         self.declare_parameter('rtk_sources_topic', '/gps/rtk_sources/json')
         self.declare_parameter('rtk_source_status_topic', '/gps/rtk_source/status_json')
         self.declare_parameter('rtk_source_select_topic', '/gps/rtk_source/select')

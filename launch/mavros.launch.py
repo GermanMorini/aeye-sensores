@@ -211,6 +211,7 @@ def generate_launch_description():
                 parameters=[
                     {"imu_topic": "/imu/data"},
                     {"gps_topic": gps_topic},
+                    {"gps_raw_topic": "/mavros_node/gps1/raw"},
                     {"rtk_sources_topic": rtk_sources_topic},
                     {"rtk_source_status_topic": rtk_source_status_topic},
                     {"rtk_source_select_topic": rtk_source_select_topic},
