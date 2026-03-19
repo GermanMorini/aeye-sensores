@@ -45,6 +45,7 @@ class RtkSourceManager(Node):
         self.declare_parameter("active_source_id", "")
         self.declare_parameter("rtcm_topic", "/rtcm")
         self.declare_parameter("source_select_topic", "/gps/rtk_source/select")
+        self.declare_parameter("source_manage_topic", "/gps/rtk_source/manage_json")
         self.declare_parameter("sources_topic", "/gps/rtk_sources/json")
         self.declare_parameter("source_status_topic", "/gps/rtk_source/status_json")
         self.declare_parameter("status_period_s", 1.0)
@@ -56,6 +57,9 @@ class RtkSourceManager(Node):
         self.rtcm_topic = str(self.get_parameter("rtcm_topic").value)
         self.source_select_topic = str(
             self.get_parameter("source_select_topic").value
+        )
+        self.source_manage_topic = str(
+            self.get_parameter("source_manage_topic").value
         )
         self.sources_topic = str(self.get_parameter("sources_topic").value)
         self.source_status_topic = str(
@@ -70,7 +74,8 @@ class RtkSourceManager(Node):
             self.get_parameter("reconnect_delay_s").value
         )
 
-        self._sources = self._load_sources(sources_config)
+        self._sources_config_path = Path(sources_config)
+        self._sources = self._load_sources(self._sources_config_path)
         self._sources_by_id = {source.id: source for source in self._sources}
         if not self._sources_by_id:
             raise RuntimeError(f"No RTK sources found in {sources_config}")
@@ -96,6 +101,9 @@ class RtkSourceManager(Node):
         self.create_subscription(
             String, self.source_select_topic, self._select_source_cb, 10
         )
+        self.create_subscription(
+            String, self.source_manage_topic, self._manage_source_cb, 10
+        )
 
         self.create_timer(self._status_period_s, self._publish_metadata)
 
@@ -118,8 +126,7 @@ class RtkSourceManager(Node):
             self._worker.join(timeout=2.0)
         return super().destroy_node()
 
-    def _load_sources(self, sources_config: str) -> list[RtkSource]:
-        path = Path(sources_config)
+    def _load_sources(self, path: Path) -> list[RtkSource]:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         raw_sources = data.get("sources") or []
         sources: list[RtkSource] = []
@@ -138,29 +145,99 @@ class RtkSourceManager(Node):
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    f"Invalid RTK source entry in {sources_config}: {raw}"
+                    f"Invalid RTK source entry in {path}: {raw}"
                 ) from exc
         return sources
 
-    def _publish_metadata(self) -> None:
-        msg_sources = String()
-        msg_sources.data = json.dumps(
+    def _serialize_sources_locked(self) -> list[dict]:
+        return [
             {
-                "sources": [
-                    {
-                        "id": source.id,
-                        "label": source.label,
-                        "host": source.host,
-                        "port": source.port,
-                        "mountpoint": source.mountpoint,
-                    }
-                    for source in self._sources
-                ]
+                "id": source.id,
+                "label": source.label,
+                "host": source.host,
+                "port": source.port,
+                "mountpoint": source.mountpoint,
             }
-        )
-        self._sources_pub.publish(msg_sources)
+            for source in self._sources
+        ]
 
+    def _write_sources_locked(self) -> None:
+        payload = {
+            "sources": [
+                {
+                    "id": source.id,
+                    "label": source.label,
+                    "host": source.host,
+                    "port": source.port,
+                    "mountpoint": source.mountpoint,
+                    "username": source.username,
+                    "password": source.password,
+                }
+                for source in self._sources
+            ]
+        }
+        self._sources_config_path.parent.mkdir(parents=True, exist_ok=True)
+        self._sources_config_path.write_text(
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+
+    def _replace_sources_locked(self, sources: list[RtkSource]) -> None:
+        self._sources = list(sources)
+        self._sources_by_id = {source.id: source for source in self._sources}
+
+    def _parse_upsert_source_locked(self, payload: dict) -> RtkSource:
+        source_id = str(payload.get("id") or "").strip()
+        if not source_id:
+            raise ValueError("missing_id")
+
+        existing = self._sources_by_id.get(source_id)
+        label = str(
+            payload.get("label")
+            or (existing.label if existing else source_id)
+        ).strip()
+        host = str(payload.get("host") or (existing.host if existing else "")).strip()
+        mountpoint = str(
+            payload.get("mountpoint") or (existing.mountpoint if existing else "")
+        ).strip()
+
+        raw_port = payload.get("port", existing.port if existing else 2101)
+        port = int(raw_port)
+        if port <= 0:
+            raise ValueError("invalid_port")
+        if not host:
+            raise ValueError("missing_host")
+        if not mountpoint:
+            raise ValueError("missing_mountpoint")
+
+        username = payload.get("username", None)
+        if username is None or (str(username).strip() == "" and existing is not None):
+            username = existing.username if existing else ""
+        username = str(username or "").strip()
+
+        password = payload.get("password", None)
+        if password is None or (str(password).strip() == "" and existing is not None):
+            password = existing.password if existing else ""
+        password = str(password or "").strip()
+
+        return RtkSource(
+            id=source_id,
+            label=label or source_id,
+            host=host,
+            port=port,
+            mountpoint=mountpoint,
+            username=username,
+            password=password,
+        )
+
+    def _publish_metadata(self) -> None:
         with self._data_lock:
+            msg_sources = String()
+            msg_sources.data = json.dumps(
+                {
+                    "sources": self._serialize_sources_locked()
+                }
+            )
             source = self._sources_by_id.get(self._active_source_id)
             rtcm_age_s = None
             if self._last_rtcm_time_s is not None:
@@ -174,7 +251,10 @@ class RtkSourceManager(Node):
                 "rtcm_age_s": rtcm_age_s,
                 "received_count": self._received_count,
                 "last_message_size": self._last_message_size,
+                "config_path": str(self._sources_config_path),
             }
+
+        self._sources_pub.publish(msg_sources)
 
         msg_status = String()
         msg_status.data = json.dumps(payload)
@@ -200,6 +280,78 @@ class RtkSourceManager(Node):
         self.get_logger().info(f"Switching RTK source to {requested_id}")
         self._close_socket()
         self._wake_connect.set()
+
+    def _manage_source_cb(self, msg: String) -> None:
+        try:
+            payload = json.loads(str(msg.data))
+        except Exception:
+            self.get_logger().warning("Ignoring invalid RTK source management payload")
+            return
+        if not isinstance(payload, dict):
+            self.get_logger().warning("Ignoring RTK source management payload that is not an object")
+            return
+
+        action = str(payload.get("action") or "upsert").strip().lower()
+        if action not in {"upsert", "delete"}:
+            self.get_logger().warning(f"Ignoring unsupported RTK source action: {action}")
+            return
+
+        reconnect = False
+        try:
+            with self._data_lock:
+                if action == "delete":
+                    source_id = str(payload.get("id") or "").strip()
+                    if not source_id:
+                        raise ValueError("missing_id")
+                    if source_id not in self._sources_by_id:
+                        raise ValueError("unknown_id")
+                    if len(self._sources) <= 1:
+                        raise ValueError("cannot_delete_last_source")
+
+                    remaining = [
+                        source for source in self._sources if source.id != source_id
+                    ]
+                    if self._active_source_id == source_id:
+                        self._active_source_id = remaining[0].id
+                        reconnect = True
+                    self._replace_sources_locked(remaining)
+                    self._write_sources_locked()
+                    self._last_error = ""
+                    self.get_logger().info(f"Deleted RTK source {source_id}")
+                else:
+                    source = self._parse_upsert_source_locked(payload)
+                    activate = bool(payload.get("activate"))
+                    existing = self._sources_by_id.get(source.id)
+                    if existing is None:
+                        new_sources = list(self._sources) + [source]
+                        self.get_logger().info(f"Added RTK source {source.id}")
+                    else:
+                        new_sources = [
+                            source if current.id == source.id else current
+                            for current in self._sources
+                        ]
+                        if existing != source:
+                            self.get_logger().info(f"Updated RTK source {source.id}")
+                    self._replace_sources_locked(new_sources)
+                    self._write_sources_locked()
+                    if activate and self._active_source_id != source.id:
+                        self._active_source_id = source.id
+                        reconnect = True
+                    if self._active_source_id == source.id:
+                        reconnect = True
+                    self._last_error = ""
+        except Exception as exc:
+            self.get_logger().warning(f"RTK source management failed: {exc}")
+            with self._data_lock:
+                self._last_error = str(exc)
+            self._publish_metadata()
+            return
+
+        self._publish_metadata()
+        if reconnect:
+            self._set_connected(False, "")
+            self._close_socket()
+            self._wake_connect.set()
 
     def _active_source(self) -> RtkSource:
         with self._data_lock:

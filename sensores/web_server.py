@@ -70,9 +70,11 @@ class PixhawkWebServer(Node):
         self.declare_parameter('rtcm_age_topic', '/gps/rtcm_age_s')
         self.declare_parameter('rtcm_count_topic', '/gps/rtcm_received_count')
         self.declare_parameter('gps_raw_topic', '/mavros_node/gps1/raw')
+        self.declare_parameter('rtk_sources_config', '')
         self.declare_parameter('rtk_sources_topic', '/gps/rtk_sources/json')
         self.declare_parameter('rtk_source_status_topic', '/gps/rtk_source/status_json')
         self.declare_parameter('rtk_source_select_topic', '/gps/rtk_source/select')
+        self.declare_parameter('rtk_source_manage_topic', '/gps/rtk_source/manage_json')
         self.declare_parameter('velocity_topic', '/velocity')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('http_host', '0.0.0.0')
@@ -88,9 +90,11 @@ class PixhawkWebServer(Node):
         rtcm_age_topic = self.get_parameter('rtcm_age_topic').value
         rtcm_count_topic = self.get_parameter('rtcm_count_topic').value
         gps_raw_topic = self.get_parameter('gps_raw_topic').value
+        rtk_sources_config = self.get_parameter('rtk_sources_config').value
         rtk_sources_topic = self.get_parameter('rtk_sources_topic').value
         rtk_source_status_topic = self.get_parameter('rtk_source_status_topic').value
         rtk_source_select_topic = self.get_parameter('rtk_source_select_topic').value
+        rtk_source_manage_topic = self.get_parameter('rtk_source_manage_topic').value
         velocity_topic = self.get_parameter('velocity_topic').value
         odom_topic = self.get_parameter('odom_topic').value
         http_host = self.get_parameter('http_host').value
@@ -106,9 +110,11 @@ class PixhawkWebServer(Node):
             'rtcm_age': str(rtcm_age_topic),
             'rtcm_count': str(rtcm_count_topic),
             'gps_raw': str(gps_raw_topic),
+            'rtk_sources_config': str(rtk_sources_config),
             'rtk_sources': str(rtk_sources_topic),
             'rtk_source_status': str(rtk_source_status_topic),
             'rtk_source_select': str(rtk_source_select_topic),
+            'rtk_source_manage': str(rtk_source_manage_topic),
             'velocity': str(velocity_topic),
             'odom': str(odom_topic),
         }
@@ -177,6 +183,9 @@ class PixhawkWebServer(Node):
         self._rtk_source_select_pub = self.create_publisher(
             String, rtk_source_select_topic, 10
         )
+        self._rtk_source_manage_pub = self.create_publisher(
+            String, rtk_source_manage_topic, 10
+        )
 
         self._httpd = self._start_http_server(http_host, int(http_port))
         self.get_logger().info(
@@ -230,6 +239,28 @@ class PixhawkWebServer(Node):
                 self._send_response(404, 'text/plain', 'Not Found')
 
             def do_POST(self):  # noqa: N802
+                if self.path == '/rtk/sources':
+                    content_length = int(self.headers.get('Content-Length', '0'))
+                    try:
+                        raw_body = self.rfile.read(content_length).decode('utf-8')
+                        body = json.loads(raw_body or '{}')
+                    except Exception:
+                        self._send_response(
+                            400,
+                            'application/json',
+                            json.dumps({'ok': False, 'error': 'invalid_json'}),
+                        )
+                        return
+
+                    result = node._upsert_rtk_source(body)
+                    status_code = 200 if result.get('ok') else 400
+                    self._send_response(
+                        status_code,
+                        'application/json',
+                        json.dumps(result),
+                    )
+                    return
+
                 if self.path.startswith('/rtk/source'):
                     content_length = int(self.headers.get('Content-Length', '0'))
                     try:
@@ -263,10 +294,25 @@ class PixhawkWebServer(Node):
 
                 self._send_response(404, 'text/plain', 'Not Found')
 
+            def do_DELETE(self):  # noqa: N802
+                prefix = '/rtk/sources/'
+                if self.path.startswith(prefix):
+                    source_id = self.path[len(prefix):].strip().strip('/')
+                    result = node._delete_rtk_source(source_id)
+                    status_code = 200 if result.get('ok') else 400
+                    self._send_response(
+                        status_code,
+                        'application/json',
+                        json.dumps(result),
+                    )
+                    return
+
+                self._send_response(404, 'text/plain', 'Not Found')
+
             def do_OPTIONS(self):  # noqa: N802
                 self.send_response(204)
                 self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
                 self.send_header('Access-Control-Allow-Headers', 'Content-Type')
                 self.end_headers()
 
@@ -312,6 +358,43 @@ class PixhawkWebServer(Node):
             return {'ok': True, 'requested_source_id': source_id, 'state': current_state}
         except Exception as exc:
             self.get_logger().error(f'Failed to request RTK source {source_id}: {exc}')
+            return {'ok': False, 'error': str(exc), 'requested_source_id': source_id}
+
+    def _upsert_rtk_source(self, body: dict) -> dict:
+        try:
+            source_id = str(body.get('id') or '').strip()
+            if not source_id:
+                return {'ok': False, 'error': 'missing_id'}
+
+            payload = {
+                'action': 'upsert',
+                'id': source_id,
+            }
+            for key in ('label', 'host', 'port', 'mountpoint', 'username', 'password'):
+                if key in body:
+                    payload[key] = body.get(key)
+            if 'activate' in body:
+                payload['activate'] = bool(body.get('activate'))
+
+            msg = String()
+            msg.data = json.dumps(payload)
+            self._rtk_source_manage_pub.publish(msg)
+            return {'ok': True, 'requested_action': 'upsert', 'requested_source': payload}
+        except Exception as exc:
+            self.get_logger().error(f'Failed to upsert RTK source: {exc}')
+            return {'ok': False, 'error': str(exc)}
+
+    def _delete_rtk_source(self, source_id: str) -> dict:
+        source_id = str(source_id or '').strip()
+        if not source_id:
+            return {'ok': False, 'error': 'missing_id'}
+        try:
+            msg = String()
+            msg.data = json.dumps({'action': 'delete', 'id': source_id})
+            self._rtk_source_manage_pub.publish(msg)
+            return {'ok': True, 'requested_action': 'delete', 'requested_source_id': source_id}
+        except Exception as exc:
+            self.get_logger().error(f'Failed to delete RTK source {source_id}: {exc}')
             return {'ok': False, 'error': str(exc), 'requested_source_id': source_id}
 
     def _start_ws_server(self, host: str, port: int):

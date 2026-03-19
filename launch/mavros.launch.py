@@ -24,6 +24,7 @@ def generate_launch_description():
     rtk_sources_config = LaunchConfiguration("rtk_sources_config")
     active_rtk_source_id = LaunchConfiguration("active_rtk_source_id")
     rtk_source_select_topic = LaunchConfiguration("rtk_source_select_topic")
+    rtk_source_manage_topic = LaunchConfiguration("rtk_source_manage_topic")
     rtk_sources_topic = LaunchConfiguration("rtk_sources_topic")
     rtk_source_status_topic = LaunchConfiguration("rtk_source_status_topic")
     gps_topic = LaunchConfiguration("gps_topic")
@@ -44,8 +45,13 @@ def generate_launch_description():
     default_config_yaml = os.path.join(
         sensores_share_dir, "config", "mavros_apm_overrides.yaml"
     )
-    default_rtk_sources_yaml = os.path.join(
-        sensores_share_dir, "config", "rtk_sources.yaml"
+    source_tree_rtk_sources_yaml = os.path.join(
+        "/ros2_ws", "src", "sensores", "config", "rtk_sources.yaml"
+    )
+    default_rtk_sources_yaml = (
+        source_tree_rtk_sources_yaml
+        if os.path.exists(source_tree_rtk_sources_yaml)
+        else os.path.join(sensores_share_dir, "config", "rtk_sources.yaml")
     )
 
     return LaunchDescription(
@@ -109,6 +115,11 @@ def generate_launch_description():
                 "rtk_source_select_topic",
                 default_value="/gps/rtk_source/select",
                 description="Topic used by the web UI to request a different RTK source",
+            ),
+            DeclareLaunchArgument(
+                "rtk_source_manage_topic",
+                default_value="/gps/rtk_source/manage_json",
+                description="Topic used by the web UI to add, update or delete RTK sources",
             ),
             DeclareLaunchArgument(
                 "rtk_sources_topic",
@@ -212,9 +223,11 @@ def generate_launch_description():
                     {"imu_topic": "/imu/data"},
                     {"gps_topic": gps_topic},
                     {"gps_raw_topic": "/mavros_node/gps1/raw"},
+                    {"rtk_sources_config": rtk_sources_config},
                     {"rtk_sources_topic": rtk_sources_topic},
                     {"rtk_source_status_topic": rtk_source_status_topic},
                     {"rtk_source_select_topic": rtk_source_select_topic},
+                    {"rtk_source_manage_topic": rtk_source_manage_topic},
                     {"velocity_topic": "/local_position/velocity_local"},
                     {"odom_topic": "/local_position/odom"},
                 ],
@@ -230,6 +243,7 @@ def generate_launch_description():
                     {"active_source_id": active_rtk_source_id},
                     {"rtcm_topic": rtcm_topic},
                     {"source_select_topic": rtk_source_select_topic},
+                    {"source_manage_topic": rtk_source_manage_topic},
                     {"sources_topic": rtk_sources_topic},
                     {"source_status_topic": rtk_source_status_topic},
                 ],
