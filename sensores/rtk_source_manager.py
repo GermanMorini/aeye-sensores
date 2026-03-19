@@ -17,6 +17,7 @@ from std_msgs.msg import String, UInt8MultiArray
 
 RTCM_BUFFER_SIZE = 4096
 RTCM_MIN_FRAME_BYTES = 6
+NTRIP_HEADER_MAX_BYTES = 16384
 
 
 @dataclass(frozen=True)
@@ -245,35 +246,68 @@ class RtkSourceManager(Node):
         ).decode("ascii")
         request = (
             f"GET /{source.mountpoint} HTTP/1.0\r\n"
-            f"Host: {source.host}:{source.port}\r\n"
-            "User-Agent: RTKSourceManager/1.0\r\n"
+            "User-Agent: NTRIP RTKLIB/2.4.3\r\n"
             "Accept: */*\r\n"
             "Connection: close\r\n"
+            "Ntrip-Version: Ntrip/2.0\r\n"
             f"Authorization: Basic {auth}\r\n"
             "\r\n"
         )
         sock.sendall(request.encode("ascii"))
 
         response = bytearray()
-        while b"\r\n\r\n" not in response:
+        while True:
             chunk = sock.recv(RTCM_BUFFER_SIZE)
             if not chunk:
+                if response:
+                    raise ConnectionError(
+                        f"NTRIP server closed during handshake: "
+                        f"{response.decode('latin1', errors='replace')[:160]}"
+                    )
                 raise ConnectionError("NTRIP server closed before sending headers")
             response.extend(chunk)
-            if len(response) > 16384:
+            parsed = self._parse_ntrip_response(bytes(response))
+            if parsed is not None:
+                first_line, payload = parsed
+                if "200" not in first_line and "ICY 200 OK" not in first_line:
+                    raise ConnectionError(
+                        f"NTRIP server rejected source {source.id}: {first_line}"
+                    )
+                self._socket = sock
+                self.get_logger().info(
+                    f"NTRIP source connected: {source.label} "
+                    f"({source.host}/{source.mountpoint})"
+                )
+                return sock, payload
+            if len(response) > NTRIP_HEADER_MAX_BYTES:
                 raise ConnectionError("NTRIP headers too large")
 
-        header_bytes, payload = response.split(b"\r\n\r\n", 1)
-        header_text = header_bytes.decode("latin1", errors="replace")
-        first_line = header_text.splitlines()[0] if header_text else ""
-        if "200" not in first_line and "ICY 200 OK" not in first_line:
-            raise ConnectionError(f"NTRIP server rejected source {source.id}: {first_line}")
+    def _parse_ntrip_response(self, response: bytes) -> Optional[tuple[str, bytes]]:
+        if response.startswith(b"ICY 200 OK"):
+            line_end = response.find(b"\r\n")
+            if line_end == -1:
+                return None
+            first_line = response[:line_end].decode("latin1", errors="replace")
+            return first_line, bytes(response[line_end + 2 :])
 
-        self._socket = sock
-        self.get_logger().info(
-            f"NTRIP source connected: {source.label} ({source.host}/{source.mountpoint})"
-        )
-        return sock, bytes(payload)
+        if response.startswith(b"HTTP/"):
+            header_end = response.find(b"\r\n\r\n")
+            header_sep_len = 4
+            if header_end == -1:
+                header_end = response.find(b"\n\n")
+                header_sep_len = 2
+            if header_end == -1:
+                return None
+            header_bytes = response[:header_end]
+            first_line = (
+                header_bytes.decode("latin1", errors="replace").splitlines()[0]
+                if header_bytes
+                else ""
+            )
+            payload = response[header_end + header_sep_len :]
+            return first_line, bytes(payload)
+
+        return None
 
     def _consume_rtcm_stream(self, buffer: bytearray) -> None:
         while len(buffer) >= RTCM_MIN_FRAME_BYTES:

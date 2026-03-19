@@ -4,7 +4,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -238,7 +238,42 @@ def generate_launch_description():
                 executable="rtk_bridge",
                 name="rtk_bridge",
                 output="screen",
-                condition=IfCondition(enable_rtk),
+                condition=IfCondition(
+                    PythonExpression(
+                        [
+                            "'",
+                            enable_rtk,
+                            "' == 'true' and '",
+                            enable_rtk_source_manager,
+                            "' == 'true'",
+                        ]
+                    )
+                ),
+                parameters=[
+                    {"enable_rtcm_tcp": False},
+                    {"rtcm_tcp_host": rtcm_tcp_host},
+                    {"rtcm_tcp_port": rtcm_tcp_port},
+                    {"rtcm_topic": rtcm_topic},
+                    {"send_rtcm_topic": send_rtcm_topic},
+                    {"gps_topic": gps_topic},
+                ],
+            ),
+            Node(
+                package="sensores",
+                executable="rtk_bridge",
+                name="rtk_bridge",
+                output="screen",
+                condition=IfCondition(
+                    PythonExpression(
+                        [
+                            "'",
+                            enable_rtk,
+                            "' == 'true' and '",
+                            enable_rtk_source_manager,
+                            "' != 'true'",
+                        ]
+                    )
+                ),
                 parameters=[
                     {"enable_rtcm_tcp": enable_rtcm_tcp},
                     {"rtcm_tcp_host": rtcm_tcp_host},
