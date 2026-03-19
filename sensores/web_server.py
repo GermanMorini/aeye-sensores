@@ -17,7 +17,9 @@ from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import Imu, NavSatFix
 from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32, Int32, String
 import websockets
+from mavros_msgs.msg import GPSRAW
 
 
 def _stamp_to_float(stamp):
@@ -28,6 +30,17 @@ def _stamp_to_float(stamp):
 
 def _normalize_angle_rad(angle_rad: float) -> float:
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+FIX_TYPE_NAMES = {
+    0: 'NO_GPS',
+    1: 'NO_FIX',
+    2: '2D_FIX',
+    3: '3D_FIX',
+    4: 'DGPS',
+    5: 'RTK_FLOAT',
+    6: 'RTK_FIXED',
+}
 
 
 def _yaw_enu_from_quaternion(
@@ -52,6 +65,11 @@ class PixhawkWebServer(Node):
 
         self.declare_parameter('imu_topic', '/imu/data')
         self.declare_parameter('gps_topic', '/gps/fix')
+        self.declare_parameter('fix_type_topic', '/gps/fix_type')
+        self.declare_parameter('rtk_status_topic', '/gps/rtk_status')
+        self.declare_parameter('rtcm_age_topic', '/gps/rtcm_age_s')
+        self.declare_parameter('rtcm_count_topic', '/gps/rtcm_received_count')
+        self.declare_parameter('gps_raw_topic', '/mavros_node/gpsstatus/gps1/raw')
         self.declare_parameter('velocity_topic', '/velocity')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('http_host', '0.0.0.0')
@@ -62,6 +80,11 @@ class PixhawkWebServer(Node):
 
         imu_topic = self.get_parameter('imu_topic').value
         gps_topic = self.get_parameter('gps_topic').value
+        fix_type_topic = self.get_parameter('fix_type_topic').value
+        rtk_status_topic = self.get_parameter('rtk_status_topic').value
+        rtcm_age_topic = self.get_parameter('rtcm_age_topic').value
+        rtcm_count_topic = self.get_parameter('rtcm_count_topic').value
+        gps_raw_topic = self.get_parameter('gps_raw_topic').value
         velocity_topic = self.get_parameter('velocity_topic').value
         odom_topic = self.get_parameter('odom_topic').value
         http_host = self.get_parameter('http_host').value
@@ -72,6 +95,11 @@ class PixhawkWebServer(Node):
         self._topic_bindings = {
             'imu': str(imu_topic),
             'gps': str(gps_topic),
+            'fix_type': str(fix_type_topic),
+            'rtk_status': str(rtk_status_topic),
+            'rtcm_age': str(rtcm_age_topic),
+            'rtcm_count': str(rtcm_count_topic),
+            'gps_raw': str(gps_raw_topic),
             'velocity': str(velocity_topic),
             'odom': str(odom_topic),
         }
@@ -85,6 +113,13 @@ class PixhawkWebServer(Node):
         self._data = {
             'imu': None,
             'gps': None,
+            'gps_meta': {
+                'fix_type': None,
+                'fix_type_name': None,
+                'rtk_status': None,
+                'rtcm_age_s': None,
+                'rtcm_received_count': None,
+            },
             'velocity': None,
             'odom': None,
             'topics': dict(self._topic_bindings),
@@ -100,6 +135,21 @@ class PixhawkWebServer(Node):
         )
         self.create_subscription(
             NavSatFix, gps_topic, self._gps_cb, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            Int32, fix_type_topic, self._fix_type_cb, 10
+        )
+        self.create_subscription(
+            GPSRAW, gps_raw_topic, self._gps_raw_cb, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            String, rtk_status_topic, self._rtk_status_cb, 10
+        )
+        self.create_subscription(
+            Float32, rtcm_age_topic, self._rtcm_age_cb, 10
+        )
+        self.create_subscription(
+            Int32, rtcm_count_topic, self._rtcm_count_cb, 10
         )
         self.create_subscription(
             TwistStamped, velocity_topic, self._velocity_cb, qos_profile_sensor_data
@@ -121,6 +171,11 @@ class PixhawkWebServer(Node):
             'Dashboard topic bindings: '
             f"imu={self._topic_bindings['imu']}, "
             f"gps={self._topic_bindings['gps']}, "
+            f"fix_type={self._topic_bindings['fix_type']}, "
+            f"rtk_status={self._topic_bindings['rtk_status']}, "
+            f"rtcm_age={self._topic_bindings['rtcm_age']}, "
+            f"rtcm_count={self._topic_bindings['rtcm_count']}, "
+            f"gps_raw={self._topic_bindings['gps_raw']}, "
             f"velocity={self._topic_bindings['velocity']}, "
             f"odom={self._topic_bindings['odom']}"
         )
@@ -250,9 +305,42 @@ class PixhawkWebServer(Node):
             'latitude': msg.latitude,
             'longitude': msg.longitude,
             'altitude': msg.altitude,
+            'position_covariance': list(msg.position_covariance),
+            'position_covariance_type': int(msg.position_covariance_type),
         }
         with self._data_lock:
             self._data['gps'] = data
+
+    def _fix_type_cb(self, msg: Int32):
+        fix_type = int(msg.data)
+        with self._data_lock:
+            self._data['gps_meta']['fix_type'] = fix_type
+            self._data['gps_meta']['fix_type_name'] = FIX_TYPE_NAMES.get(
+                fix_type, 'UNKNOWN'
+            )
+
+    def _gps_raw_cb(self, msg: GPSRAW):
+        fix_type = int(msg.fix_type)
+        with self._data_lock:
+            self._data['gps_meta']['fix_type'] = fix_type
+            self._data['gps_meta']['fix_type_name'] = FIX_TYPE_NAMES.get(
+                fix_type, 'UNKNOWN'
+            )
+            self._data['gps_meta']['satellites_visible'] = int(msg.satellites_visible)
+            self._data['gps_meta']['eph'] = int(msg.eph)
+            self._data['gps_meta']['epv'] = int(msg.epv)
+
+    def _rtk_status_cb(self, msg: String):
+        with self._data_lock:
+            self._data['gps_meta']['rtk_status'] = str(msg.data)
+
+    def _rtcm_age_cb(self, msg: Float32):
+        with self._data_lock:
+            self._data['gps_meta']['rtcm_age_s'] = float(msg.data)
+
+    def _rtcm_count_cb(self, msg: Int32):
+        with self._data_lock:
+            self._data['gps_meta']['rtcm_received_count'] = int(msg.data)
 
     def _velocity_cb(self, msg: TwistStamped):
         data = {

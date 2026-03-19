@@ -6,4 +6,5 @@
       - imu
       - global_position
       - local_position
+      - gps_status
       - gps_rtk
