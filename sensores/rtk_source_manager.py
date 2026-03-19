@@ -286,26 +286,22 @@ class RtkSourceManager(Node):
         if response.startswith(b"ICY 200 OK"):
             line_end = response.find(b"\r\n")
             if line_end == -1:
+                line_end = response.find(b"\n")
+            if line_end == -1:
                 return None
             first_line = response[:line_end].decode("latin1", errors="replace")
-            return first_line, bytes(response[line_end + 2 :])
+            separator_len = 2 if response[line_end: line_end + 2] == b"\r\n" else 1
+            return first_line, bytes(response[line_end + separator_len :])
 
         if response.startswith(b"HTTP/"):
-            header_end = response.find(b"\r\n\r\n")
-            header_sep_len = 4
-            if header_end == -1:
-                header_end = response.find(b"\n\n")
-                header_sep_len = 2
-            if header_end == -1:
+            line_end = response.find(b"\r\n")
+            if line_end == -1:
+                line_end = response.find(b"\n")
+            if line_end == -1:
                 return None
-            header_bytes = response[:header_end]
-            first_line = (
-                header_bytes.decode("latin1", errors="replace").splitlines()[0]
-                if header_bytes
-                else ""
-            )
-            payload = response[header_end + header_sep_len :]
-            return first_line, bytes(payload)
+            first_line = response[:line_end].decode("latin1", errors="replace")
+            separator_len = 2 if response[line_end: line_end + 2] == b"\r\n" else 1
+            return first_line, bytes(response[line_end + separator_len :])
 
         return None
 
