@@ -70,6 +70,9 @@ class PixhawkWebServer(Node):
         self.declare_parameter('rtcm_age_topic', '/gps/rtcm_age_s')
         self.declare_parameter('rtcm_count_topic', '/gps/rtcm_received_count')
         self.declare_parameter('gps_raw_topic', '/mavros_node/gpsstatus/gps1/raw')
+        self.declare_parameter('rtk_sources_topic', '/gps/rtk_sources/json')
+        self.declare_parameter('rtk_source_status_topic', '/gps/rtk_source/status_json')
+        self.declare_parameter('rtk_source_select_topic', '/gps/rtk_source/select')
         self.declare_parameter('velocity_topic', '/velocity')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('http_host', '0.0.0.0')
@@ -85,6 +88,9 @@ class PixhawkWebServer(Node):
         rtcm_age_topic = self.get_parameter('rtcm_age_topic').value
         rtcm_count_topic = self.get_parameter('rtcm_count_topic').value
         gps_raw_topic = self.get_parameter('gps_raw_topic').value
+        rtk_sources_topic = self.get_parameter('rtk_sources_topic').value
+        rtk_source_status_topic = self.get_parameter('rtk_source_status_topic').value
+        rtk_source_select_topic = self.get_parameter('rtk_source_select_topic').value
         velocity_topic = self.get_parameter('velocity_topic').value
         odom_topic = self.get_parameter('odom_topic').value
         http_host = self.get_parameter('http_host').value
@@ -100,6 +106,9 @@ class PixhawkWebServer(Node):
             'rtcm_age': str(rtcm_age_topic),
             'rtcm_count': str(rtcm_count_topic),
             'gps_raw': str(gps_raw_topic),
+            'rtk_sources': str(rtk_sources_topic),
+            'rtk_source_status': str(rtk_source_status_topic),
+            'rtk_source_select': str(rtk_source_select_topic),
             'velocity': str(velocity_topic),
             'odom': str(odom_topic),
         }
@@ -120,6 +129,8 @@ class PixhawkWebServer(Node):
                 'rtcm_age_s': None,
                 'rtcm_received_count': None,
             },
+            'rtk_sources': [],
+            'rtk_source_state': None,
             'velocity': None,
             'odom': None,
             'topics': dict(self._topic_bindings),
@@ -152,10 +163,19 @@ class PixhawkWebServer(Node):
             Int32, rtcm_count_topic, self._rtcm_count_cb, 10
         )
         self.create_subscription(
+            String, rtk_sources_topic, self._rtk_sources_cb, 10
+        )
+        self.create_subscription(
+            String, rtk_source_status_topic, self._rtk_source_status_cb, 10
+        )
+        self.create_subscription(
             TwistStamped, velocity_topic, self._velocity_cb, qos_profile_sensor_data
         )
         self.create_subscription(
             Odometry, odom_topic, self._odom_cb, qos_profile_sensor_data
+        )
+        self._rtk_source_select_pub = self.create_publisher(
+            String, rtk_source_select_topic, 10
         )
 
         self._httpd = self._start_http_server(http_host, int(http_port))
@@ -199,7 +219,56 @@ class PixhawkWebServer(Node):
                     payload = node._get_snapshot()
                     self._send_response(200, 'application/json', payload)
                     return
+                if self.path.startswith('/rtk/sources'):
+                    payload = node._get_rtk_sources_snapshot()
+                    self._send_response(200, 'application/json', payload)
+                    return
+                if self.path.startswith('/rtk/status'):
+                    payload = node._get_rtk_source_status_snapshot()
+                    self._send_response(200, 'application/json', payload)
+                    return
                 self._send_response(404, 'text/plain', 'Not Found')
+
+            def do_POST(self):  # noqa: N802
+                if self.path.startswith('/rtk/source'):
+                    content_length = int(self.headers.get('Content-Length', '0'))
+                    try:
+                        raw_body = self.rfile.read(content_length).decode('utf-8')
+                        body = json.loads(raw_body or '{}')
+                    except Exception:
+                        self._send_response(
+                            400,
+                            'application/json',
+                            json.dumps({'ok': False, 'error': 'invalid_json'}),
+                        )
+                        return
+
+                    source_id = str(body.get('id') or '').strip()
+                    if not source_id:
+                        self._send_response(
+                            400,
+                            'application/json',
+                            json.dumps({'ok': False, 'error': 'missing_id'}),
+                        )
+                        return
+
+                    result = node._request_rtk_source(source_id)
+                    status_code = 200 if result.get('ok') else 400
+                    self._send_response(
+                        status_code,
+                        'application/json',
+                        json.dumps(result),
+                    )
+                    return
+
+                self._send_response(404, 'text/plain', 'Not Found')
+
+            def do_OPTIONS(self):  # noqa: N802
+                self.send_response(204)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+                self.end_headers()
 
             def _send_response(self, code, content_type, body):
                 if isinstance(body, str):
@@ -208,6 +277,7 @@ class PixhawkWebServer(Node):
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(body)))
                 self.send_header('Cache-Control', 'no-store')
+                self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -222,6 +292,27 @@ class PixhawkWebServer(Node):
     def _get_snapshot(self) -> str:
         with self._data_lock:
             return json.dumps(self._data)
+
+    def _get_rtk_sources_snapshot(self) -> str:
+        with self._data_lock:
+            return json.dumps({'sources': list(self._data.get('rtk_sources') or [])})
+
+    def _get_rtk_source_status_snapshot(self) -> str:
+        with self._data_lock:
+            return json.dumps(self._data.get('rtk_source_state') or {})
+
+    def _request_rtk_source(self, source_id: str) -> dict:
+        try:
+            msg = String()
+            msg.data = source_id
+            self._rtk_source_select_pub.publish(msg)
+            with self._data_lock:
+                current_state = dict(self._data.get('rtk_source_state') or {})
+            current_state['requested_source_id'] = source_id
+            return {'ok': True, 'requested_source_id': source_id, 'state': current_state}
+        except Exception as exc:
+            self.get_logger().error(f'Failed to request RTK source {source_id}: {exc}')
+            return {'ok': False, 'error': str(exc), 'requested_source_id': source_id}
 
     def _start_ws_server(self, host: str, port: int):
         self._ws_loop = asyncio.new_event_loop()
@@ -341,6 +432,43 @@ class PixhawkWebServer(Node):
     def _rtcm_count_cb(self, msg: Int32):
         with self._data_lock:
             self._data['gps_meta']['rtcm_received_count'] = int(msg.data)
+
+    def _rtk_sources_cb(self, msg: String):
+        try:
+            payload = json.loads(str(msg.data))
+            sources = payload.get('sources') or []
+            if not isinstance(sources, list):
+                return
+        except Exception:
+            return
+
+        normalized = []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            normalized.append(
+                {
+                    'id': str(source.get('id') or ''),
+                    'label': str(source.get('label') or source.get('id') or ''),
+                    'host': str(source.get('host') or ''),
+                    'port': source.get('port'),
+                    'mountpoint': str(source.get('mountpoint') or ''),
+                }
+            )
+
+        with self._data_lock:
+            self._data['rtk_sources'] = normalized
+
+    def _rtk_source_status_cb(self, msg: String):
+        try:
+            payload = json.loads(str(msg.data))
+            if not isinstance(payload, dict):
+                return
+        except Exception:
+            return
+
+        with self._data_lock:
+            self._data['rtk_source_state'] = payload
 
     def _velocity_cb(self, msg: TwistStamped):
         data = {

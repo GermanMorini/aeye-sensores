@@ -16,10 +16,16 @@ def generate_launch_description():
     launch_legacy_compat = LaunchConfiguration("launch_legacy_compat")
     enable_rtk = LaunchConfiguration("enable_rtk")
     enable_rtcm_tcp = LaunchConfiguration("enable_rtcm_tcp")
+    enable_rtk_source_manager = LaunchConfiguration("enable_rtk_source_manager")
     rtcm_tcp_host = LaunchConfiguration("rtcm_tcp_host")
     rtcm_tcp_port = LaunchConfiguration("rtcm_tcp_port")
     rtcm_topic = LaunchConfiguration("rtcm_topic")
     send_rtcm_topic = LaunchConfiguration("send_rtcm_topic")
+    rtk_sources_config = LaunchConfiguration("rtk_sources_config")
+    active_rtk_source_id = LaunchConfiguration("active_rtk_source_id")
+    rtk_source_select_topic = LaunchConfiguration("rtk_source_select_topic")
+    rtk_sources_topic = LaunchConfiguration("rtk_sources_topic")
+    rtk_source_status_topic = LaunchConfiguration("rtk_source_status_topic")
     gps_topic = LaunchConfiguration("gps_topic")
     fcu_url = LaunchConfiguration("fcu_url")
     gcs_url = LaunchConfiguration("gcs_url")
@@ -37,6 +43,9 @@ def generate_launch_description():
     default_apm_config_yaml = os.path.join(mavros_share_dir, "launch", "apm_config.yaml")
     default_config_yaml = os.path.join(
         sensores_share_dir, "config", "mavros_apm_overrides.yaml"
+    )
+    default_rtk_sources_yaml = os.path.join(
+        sensores_share_dir, "config", "rtk_sources.yaml"
     )
 
     return LaunchDescription(
@@ -62,6 +71,11 @@ def generate_launch_description():
                 description="Read RTCM corrections from a TCP source",
             ),
             DeclareLaunchArgument(
+                "enable_rtk_source_manager",
+                default_value="false",
+                description="Launch the NTRIP source manager so the web UI can switch RTCM bases",
+            ),
+            DeclareLaunchArgument(
                 "rtcm_tcp_host",
                 default_value="127.0.0.1",
                 description="Host for the incoming RTCM TCP stream",
@@ -80,6 +94,31 @@ def generate_launch_description():
                 "send_rtcm_topic",
                 default_value="/mavros_node/send_rtcm",
                 description="Topic consumed by the MAVROS gps_rtk plugin; override if mavros_node runs in a namespace",
+            ),
+            DeclareLaunchArgument(
+                "rtk_sources_config",
+                default_value=default_rtk_sources_yaml,
+                description="YAML file with the available RTK bases for the source manager",
+            ),
+            DeclareLaunchArgument(
+                "active_rtk_source_id",
+                default_value="",
+                description="Initial RTK source id; empty falls back to the first entry in rtk_sources_config",
+            ),
+            DeclareLaunchArgument(
+                "rtk_source_select_topic",
+                default_value="/gps/rtk_source/select",
+                description="Topic used by the web UI to request a different RTK source",
+            ),
+            DeclareLaunchArgument(
+                "rtk_sources_topic",
+                default_value="/gps/rtk_sources/json",
+                description="Topic where the RTK source manager publishes the available source catalog",
+            ),
+            DeclareLaunchArgument(
+                "rtk_source_status_topic",
+                default_value="/gps/rtk_source/status_json",
+                description="Topic where the RTK source manager publishes the current source state",
             ),
             DeclareLaunchArgument(
                 "gps_topic",
@@ -172,8 +211,26 @@ def generate_launch_description():
                 parameters=[
                     {"imu_topic": "/imu/data"},
                     {"gps_topic": gps_topic},
+                    {"rtk_sources_topic": rtk_sources_topic},
+                    {"rtk_source_status_topic": rtk_source_status_topic},
+                    {"rtk_source_select_topic": rtk_source_select_topic},
                     {"velocity_topic": "/local_position/velocity_local"},
                     {"odom_topic": "/local_position/odom"},
+                ],
+            ),
+            Node(
+                package="sensores",
+                executable="rtk_source_manager",
+                name="rtk_source_manager",
+                output="screen",
+                condition=IfCondition(enable_rtk_source_manager),
+                parameters=[
+                    {"sources_config": rtk_sources_config},
+                    {"active_source_id": active_rtk_source_id},
+                    {"rtcm_topic": rtcm_topic},
+                    {"source_select_topic": rtk_source_select_topic},
+                    {"sources_topic": rtk_sources_topic},
+                    {"source_status_topic": rtk_source_status_topic},
                 ],
             ),
             Node(
